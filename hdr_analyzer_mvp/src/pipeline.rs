@@ -23,23 +23,28 @@ fn copy_frame(frame: &MadVRFrame) -> MadVRFrame {
 
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 
-use ffmpeg_next::{format, frame, software};
+use ffmpeg_next::{codec, format, frame, software, util::color};
 
 use crate::analysis::frame::{analyze_native_frame_cropped, FrameAnalysisOptions, FramePeakStats};
 use crate::analysis::gpu::GpuAnalyzer;
 use crate::analysis::histogram::{
     apply_histogram_ema, apply_histogram_temporal_median, select_peak_pq,
 };
+use crate::analysis::hlg::PQ_MAPPING;
 use crate::analysis::scene::{
-    calculate_histogram_difference, convert_scene_cuts_to_scenes, cut_allowed,
+    calculate_histogram_difference, convert_scene_cuts_to_scenes, cut_allowed, scene_series,
+    select_scene_cuts, SceneSeries,
 };
 use crate::cli::{Cli, PeakDomain, PeakEstimator};
 use crate::crop::{detect_crop, is_frame_usable_for_crop, CropRect, CROP_EDGE_TOLERANCE};
 use crate::ffmpeg_io::{
-    open_software_decoder, probe_crop, setup_hardware_decoder, transfer_hardware_frame,
-    TransferFunction, VideoInfo,
+    codec_extradata, open_software_decoder, probe_crop, setup_hardware_decoder,
+    transfer_hardware_frame, TransferFunction, VideoInfo,
 };
-use crate::l1_sidecar::{write_l1_sidecar, FrameL1Measurement};
+use crate::l1_sidecar::{
+    write_l1_sidecar, AnalysisMetadata, FrameL1Measurement, SidecarProvenance, SourceMetadata,
+};
+use crate::leading_pictures::{hevc_framing, LeadingPictureScan};
 use crate::optimizer::{run_optimizer_pass, OptimizerProfile};
 use crate::writer::write_measurement_file;
 
@@ -58,26 +63,71 @@ fn peak_estimator_name(estimator: PeakEstimator) -> &'static str {
     }
 }
 
-fn write_frame_stats_csv(path: &Path, stats: &[FramePeakStats]) -> Result<()> {
+/// Final scene cuts and the series they were chosen from.
+///
+/// Runs after the frame loop, on the unsmoothed histograms of the analyzed frames (with
+/// `--sample-rate` the skipped frames only hold copies), so a decision can look ahead.
+fn detect_scene_cuts(
+    frames: &[MadVRFrame],
+    sample_rate: u32,
+    threshold: f64,
+    min_scene_length: u32,
+) -> (Vec<u32>, Vec<u32>, SceneSeries) {
+    let step = sample_rate.max(1) as usize;
+    let frame_indices: Vec<u32> = (0..frames.len()).step_by(step).map(|i| i as u32).collect();
+    let histograms: Vec<&[f64]> = frame_indices
+        .iter()
+        .map(|&index| frames[index as usize].lum_histogram.as_slice())
+        .collect();
+    let series = scene_series(&histograms);
+    let cuts = select_scene_cuts(&series, &frame_indices, threshold, min_scene_length);
+    (cuts, frame_indices, series)
+}
+
+fn write_frame_stats_csv(
+    path: &Path,
+    stats: &[FramePeakStats],
+    frame_indices: &[u32],
+    series: &SceneSeries,
+    scenes: &[MadVRScene],
+) -> Result<()> {
+    // Frames skipped by --sample-rate have no scene values of their own.
+    let mut scene_values = vec![(0.0, 0.0, 0.0); stats.len()];
+    for (position, &frame) in frame_indices.iter().enumerate() {
+        if let Some(slot) = scene_values.get_mut(frame as usize) {
+            *slot = (
+                series.diff[position],
+                series.score[position],
+                series.baseline[position],
+            );
+        }
+    }
+    let cut_frames: std::collections::HashSet<u32> =
+        scenes.iter().map(|scene| scene.start).collect();
     let file = File::create(path)
         .with_context(|| format!("Failed to create frame-stats CSV {}", path.display()))?;
     let mut writer = BufWriter::new(file);
     writeln!(
         writer,
-        "frame,selected_pq,raw_max_pq,percentile_pq,robust_pq,sigma_pq,correction_pq,n_eff"
+        "frame,selected_pq,raw_max_pq,percentile_pq,robust_pq,sigma_pq,correction_pq,n_eff,scene_diff,scene_score,scene_baseline,scene_start"
     )?;
 
     for (frame_index, stat) in stats.iter().enumerate() {
+        let (scene_diff, scene_score, scene_baseline) = scene_values[frame_index];
         writeln!(
             writer,
-            "{frame_index},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{}",
+            "{frame_index},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{},{:.6},{:.6},{:.6},{}",
             stat.selected_peak_pq,
             stat.raw_max_pq,
             stat.percentile_pq,
             stat.robust_pq,
             stat.sigma_pq,
             stat.correction_pq,
-            stat.n_eff
+            stat.n_eff,
+            scene_diff,
+            scene_score,
+            scene_baseline,
+            u8::from(cut_frames.contains(&(frame_index as u32)))
         )?;
     }
     writer
@@ -170,6 +220,21 @@ fn resolve_crop_rect(
     }
 }
 
+/// The frame in host memory: `decoded` itself, or its NVDEC surface downloaded once into
+/// `transferred` on first use. Never hand an `AV_PIX_FMT_CUDA` frame to host-side code.
+fn host_view<'a>(
+    decoded: &'a frame::Video,
+    transferred: &'a mut Option<frame::Video>,
+) -> Result<&'a frame::Video> {
+    if decoded.format() != format::Pixel::CUDA {
+        return Ok(decoded);
+    }
+    if transferred.is_none() {
+        *transferred = Some(transfer_hardware_frame(decoded)?);
+    }
+    Ok(transferred.as_ref().expect("transferred above"))
+}
+
 /// Sample crop stability at an accepted scene cut. Cuts landing on black/low-signal
 /// frames are counted as skipped instead of polluting the variable-AR telemetry.
 fn sample_scene_cut_crop(
@@ -255,6 +320,40 @@ fn scale_rect(rect: CropRect, factor: u32) -> CropRect {
     }
 }
 
+/// Map a crop from the CPU path's downscaled analysis space back to full-resolution source
+/// coordinates. Edges that touch the analysis frame border snap to the source border so an
+/// even-rounded analysis size never invents a 1-2 pixel offset.
+fn crop_to_full_resolution(
+    rect: CropRect,
+    downscale: u32,
+    analysis_size: (u32, u32),
+    full_size: (u32, u32),
+) -> CropRect {
+    if downscale <= 1 {
+        return rect;
+    }
+    let (analysis_w, analysis_h) = analysis_size;
+    let (full_w, full_h) = full_size;
+    let x = (rect.x * downscale).min(full_w.saturating_sub(2));
+    let y = (rect.y * downscale).min(full_h.saturating_sub(2));
+    let right = if rect.x + rect.width >= analysis_w {
+        full_w
+    } else {
+        ((rect.x + rect.width) * downscale).min(full_w)
+    };
+    let bottom = if rect.y + rect.height >= analysis_h {
+        full_h
+    } else {
+        ((rect.y + rect.height) * downscale).min(full_h)
+    };
+    CropRect {
+        x,
+        y,
+        width: right.saturating_sub(x).max(2),
+        height: bottom.saturating_sub(y).max(2),
+    }
+}
+
 fn shrink_rect(rect: CropRect, factor: u32) -> CropRect {
     CropRect {
         x: rect.x / factor,
@@ -271,30 +370,46 @@ pub fn run(
     mut input_context: format::context::Input,
 ) -> Result<()> {
     let peak_domain = match video_info.transfer_function {
-        TransferFunction::Hlg => {
-            if cli.peak_domain == Some(PeakDomain::MaxRgb) {
-                eprintln!("Warning: --peak-domain max-rgb is not supported for HLG; using luma.");
-            }
-            PeakDomain::Luma
-        }
-        TransferFunction::Pq | TransferFunction::Unknown => {
+        TransferFunction::Pq | TransferFunction::Hlg | TransferFunction::Unknown => {
             cli.peak_domain.unwrap_or(PeakDomain::MaxRgb)
+        }
+        TransferFunction::Unsupported(name) => {
+            anyhow::bail!(
+                "transfer characteristic '{name}' is not an HDR transfer; this analyzer measures PQ (SMPTE 2084) and HLG signals only"
+            );
         }
     };
 
     match video_info.transfer_function {
         TransferFunction::Hlg => {
             println!(
-                "Detected HLG transfer function. Using native HLG→PQ conversion (peak {:.0} nits).",
-                cli.hlg_peak_nits
+                "Detected HLG transfer function. Measuring through the Dolby Vision Profile 8.4 decode (luma curve, chroma MMR, RPU matrix) of the '{}' composer.",
+                cli.hlg_composer.cli_name()
             );
         }
         TransferFunction::Unknown => {
             println!(
-                "Transfer function unspecified; defaulting to PQ analysis path. Use --hlg-peak-nits if needed."
+                "Transfer function unspecified; defaulting to PQ analysis path. Tag HLG sources as arib-std-b67 to measure them through the Dolby Vision Profile 8.4 curve."
             );
         }
-        TransferFunction::Pq => {}
+        TransferFunction::Pq | TransferFunction::Unsupported(_) => {}
+    }
+
+    if video_info.color_range == color::Range::JPEG {
+        eprintln!(
+            "Warning: stream is tagged full range; samples are interpreted as limited range (64..940), so measured levels will be biased."
+        );
+    }
+    // BT.2020 constant luminance is not BT.2020 NCL either: the PQ max-RGB and the DV 8.4
+    // decode both assume NCL, so it warns too.
+    if !matches!(
+        video_info.color_space,
+        color::Space::Unspecified | color::Space::BT2020NCL
+    ) {
+        eprintln!(
+            "Warning: stream matrix is tagged {:?}; max-RGB peaks use BT.2020 non-constant-luminance coefficients.",
+            video_info.color_space
+        );
     }
 
     println!(
@@ -319,6 +434,13 @@ pub fn run(
     }
 
     let downscale = effective_downscale(cli.downscale);
+    if cli.peak_estimator == PeakEstimator::Robust && downscale > 1 {
+        eprintln!(
+            "Warning: --peak-estimator robust is specified for --downscale 1. With --downscale {downscale} \
+             the grain measurement and the pixel counts of its rule refer to analysis samples, \
+             not source pixels."
+        );
+    }
     let input_path = cli
         .input_positional
         .as_deref()
@@ -361,40 +483,48 @@ pub fn run(
         }
     };
 
-    let (mut scenes, mut frames, mut l1_measurements, frame_peak_stats, crop) =
-        run_native_analysis_pipeline(
-            cli,
-            video_info,
-            &mut input_context,
-            downscale,
-            initial_crop,
-            &FrameAnalysisOptions {
-                denoise_mode: &cli.pre_denoise,
-                transfer_function: video_info.transfer_function,
-                hlg_peak_nits: cli.hlg_peak_nits,
-                peak_domain,
-                min_percentile: cli.min_percentile,
-                peak_estimator: cli.peak_estimator,
-                peak_percentile: cli.peak_percentile,
-            },
-        )?;
+    let (
+        mut scenes,
+        mut frames,
+        l1_measurements,
+        frame_peak_stats,
+        crop,
+        gpu_active,
+        stream_frames,
+    ) = run_native_analysis_pipeline(
+        cli,
+        video_info,
+        &mut input_context,
+        downscale,
+        initial_crop,
+        &FrameAnalysisOptions {
+            denoise_mode: &cli.pre_denoise,
+            transfer_function: video_info.transfer_function,
+            hlg_composer: cli.hlg_composer,
+            peak_domain,
+            min_percentile: cli.min_percentile,
+            peak_estimator: cli.peak_estimator,
+            peak_percentile: cli.peak_percentile,
+        },
+    )?;
 
     if let Some(path) = &cli.dump_frame_stats {
-        write_frame_stats_csv(path, &frame_peak_stats)?;
+        let (_, frame_indices, series) = detect_scene_cuts(
+            &frames,
+            cli.sample_rate,
+            cli.scene_threshold,
+            cli.min_scene_length,
+        );
+        write_frame_stats_csv(path, &frame_peak_stats, &frame_indices, &series, &scenes)?;
         println!("Wrote frame peak statistics: {}", path.display());
     }
 
     fix_scene_end_frames(&mut scenes, frames.len());
 
-    // Apply histogram and both full-precision-average smoothing series with scene-aware resets.
+    // Smooth the histograms and the madVR frame averages with scene-aware resets. The L1
+    // measurements stay unfiltered.
     if cli.hist_bin_ema_beta > 0.0 || cli.hist_temporal_median > 0 {
-        apply_histogram_smoothing_pass(
-            &scenes,
-            &mut frames,
-            &mut l1_measurements,
-            cli,
-            peak_domain,
-        )?;
+        apply_histogram_smoothing_pass(&scenes, &mut frames, cli, peak_domain)?;
     }
 
     precompute_scene_stats(&mut scenes, &frames);
@@ -467,10 +597,100 @@ pub fn run(
         cli.peak_estimator,
         cli.peak_percentile,
         crop,
+        &SidecarProvenance {
+            source: SourceMetadata {
+                file_name: Path::new(input_path)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                size_bytes: std::fs::metadata(input_path)
+                    .map(|meta| meta.len())
+                    .unwrap_or(0),
+                width: video_info.width,
+                height: video_info.height,
+                transfer_function: video_info.transfer_function.to_string(),
+                stream_frames: stream_frames.stream,
+                leading_skipped_frames: stream_frames.leading_skipped,
+            },
+            analysis: AnalysisMetadata {
+                downscale,
+                sample_rate: cli.sample_rate.max(1),
+                gpu: gpu_active,
+                no_crop: cli.no_crop,
+                luminance_mapping: match video_info.transfer_function {
+                    TransferFunction::Hlg => cli.hlg_composer.luminance_mapping(),
+                    _ => PQ_MAPPING,
+                }
+                .to_owned(),
+            },
+        },
     )?;
     println!("Wrote L1 measurement sidecar: {}", sidecar_path.display());
 
     Ok(())
+}
+
+#[cfg(test)]
+mod scene_cut_tests {
+    use super::*;
+
+    fn frame(bin: usize) -> MadVRFrame {
+        let mut lum_histogram = vec![0.0; 256];
+        lum_histogram[bin] = 100.0;
+        MadVRFrame {
+            lum_histogram,
+            ..Default::default()
+        }
+    }
+
+    /// With `--sample-rate 3` the frames in between hold a copy of the last analyzed frame.
+    /// The shot changes at source frame 40; the first analyzed frame of the new shot is 42.
+    #[test]
+    fn sampled_analysis_cuts_at_the_first_analyzed_frame_of_a_shot() {
+        let frames: Vec<MadVRFrame> = (0..90)
+            .map(|index| frame(if index - index % 3 < 40 { 30 } else { 180 }))
+            .collect();
+        let (cuts, frame_indices, series) = detect_scene_cuts(&frames, 3, 3.0, 12);
+        assert_eq!(cuts, vec![42]);
+        assert_eq!(frame_indices.len(), 30);
+        assert_eq!(series.diff.len(), 30);
+
+        // Every frame analyzed: the copies make the picture change at 42 as well.
+        let (cuts, _, _) = detect_scene_cuts(&frames, 1, 3.0, 12);
+        assert_eq!(cuts, vec![42]);
+    }
+}
+
+#[cfg(test)]
+mod crop_space_tests {
+    use super::*;
+
+    #[test]
+    fn cpu_crop_maps_back_to_full_resolution() {
+        let letterbox = CropRect {
+            x: 0,
+            y: 140,
+            width: 1920,
+            height: 800,
+        };
+        let full = crop_to_full_resolution(letterbox, 2, (1920, 1080), (3840, 2160));
+        assert_eq!(
+            (full.x, full.y, full.width, full.height),
+            (0, 280, 3840, 1600)
+        );
+        let unscaled = crop_to_full_resolution(letterbox, 1, (1920, 1080), (1920, 1080));
+        assert_eq!(unscaled.height, 800);
+    }
+
+    #[test]
+    fn edge_touching_crop_snaps_to_odd_source_border() {
+        let full_frame = CropRect::full(958, 538);
+        let mapped = crop_to_full_resolution(full_frame, 2, (958, 538), (1917, 1077));
+        assert_eq!(
+            (mapped.x, mapped.y, mapped.width, mapped.height),
+            (0, 0, 1917, 1077)
+        );
+    }
 }
 
 fn compute_scene_diff(cli: &Cli, curr_hist: &[f64], prev_hist: &[f64]) -> f64 {
@@ -494,6 +714,8 @@ fn run_native_analysis_pipeline(
     Vec<FrameL1Measurement>,
     Vec<FramePeakStats>,
     CropRect,
+    bool,
+    StreamFrames,
 )> {
     println!("Starting native analysis pipeline...");
     let total_frames = video_info.total_frames;
@@ -504,19 +726,23 @@ fn run_native_analysis_pipeline(
         .context("No video stream found")?;
     let video_stream_index = video_stream.index();
     let codec_parameters = video_stream.parameters();
+    let mut leading_scan = (codec_parameters.id() == codec::Id::HEVC)
+        .then(|| LeadingPictureScan::new(hevc_framing(&codec_extradata(&codec_parameters))));
+    let mut stream_pictures = 0u64;
 
     let cuda_requested = cli.hwaccel.as_deref() == Some("cuda");
     let gpu_block_reason = if !cuda_requested {
         None
     } else if analysis_options.denoise_mode == "median3" {
         Some("--pre-denoise median3 is CPU-only")
-    } else if analysis_options.peak_estimator == PeakEstimator::Robust {
-        Some("--peak-estimator robust is CPU-only (needs grain statistics)")
     } else {
         None
     };
     let mut gpu_analyzer = if cuda_requested && gpu_block_reason.is_none() {
-        match GpuAnalyzer::new(analysis_options.transfer_function, cli.hlg_peak_nits) {
+        match GpuAnalyzer::new(
+            analysis_options.transfer_function,
+            analysis_options.hlg_composer,
+        ) {
             Ok(analyzer) => {
                 println!(
                     "CUDA analysis active (NVRTC kernel on full-resolution frames, {}x sampling stride)",
@@ -582,11 +808,8 @@ fn run_native_analysis_pipeline(
     let mut frames = Vec::new();
     let mut l1_measurements = Vec::new();
     let mut frame_peak_stats = Vec::new();
-    let mut scene_cuts = Vec::new();
     let mut previous_histogram: Option<Vec<f64>> = None;
-    let smoothing_window = cli.scene_smoothing as usize;
-    let mut diff_window: VecDeque<f64> = VecDeque::with_capacity(smoothing_window.max(1));
-    let mut last_cut_frame: u32 = 0;
+    let mut last_crop_sample_frame: u32 = 0;
     let mut frame_count = 0u32;
     let mut analysis_duration = Duration::ZERO;
 
@@ -595,6 +818,15 @@ fn run_native_analysis_pipeline(
     let mut last_analyzed_frame: Option<MadVRFrame> = None;
     let mut last_l1_measurement: Option<FrameL1Measurement> = None;
     let mut last_peak_stats: Option<FramePeakStats> = None;
+
+    // In-place analysis of NVDEC frames (see GpuAnalyzer::analyze_device). The environment
+    // override forces the host-download path, for parity checks against in-place analysis.
+    let mut device_frames_blocked: Option<&'static str> =
+        std::env::var_os("HDR_ANALYZER_CUDA_HOST_FRAMES")
+            .map(|_| "HDR_ANALYZER_CUDA_HOST_FRAMES is set");
+    let mut device_path_reported = false;
+    let mut device_frames = 0u64;
+    let mut host_downloads = 0u64;
 
     let start_time = Instant::now();
 
@@ -638,12 +870,8 @@ fn run_native_analysis_pipeline(
         let should_analyze = frame_count % sample_rate == 0 || last_analyzed_frame.is_none();
 
         let (analyzed_frame, l1_measurement, peak_stats) = if should_analyze {
-            let transferred = if decoded_frame.format() == format::Pixel::CUDA {
-                Some(transfer_hardware_frame(decoded_frame)?)
-            } else {
-                None
-            };
-            let host_frame = transferred.as_ref().unwrap_or(decoded_frame);
+            // NVDEC frames are downloaded only when the host needs their pixels.
+            let mut transferred: Option<frame::Video> = None;
 
             let analysis_start = if cli.profile_performance {
                 Some(Instant::now())
@@ -654,9 +882,66 @@ fn run_native_analysis_pipeline(
             let mut gpu_output = None;
             let mut gpu_failed = false;
             if let Some(analyzer) = gpu_analyzer.as_mut() {
-                let rect = resolve_crop_rect(&mut crop_rect_opt, &mut crop_monitor, host_frame);
-                match analyzer.analyze(host_frame, &rect, downscale, analysis_options) {
+                let in_place = decoded_frame.format() == format::Pixel::CUDA
+                    && match device_frames_blocked
+                        .or_else(|| analyzer.device_frame_ineligibility(decoded_frame))
+                    {
+                        None => true,
+                        Some(reason) => {
+                            if !device_path_reported {
+                                println!(
+                                    "\nCUDA analysis downloads NVDEC frames to host memory: {reason}"
+                                );
+                                device_path_reported = true;
+                            }
+                            false
+                        }
+                    };
+                if in_place && !device_path_reported {
+                    println!("\nCUDA analysis on NVDEC device frames (no host round trip)");
+                    device_path_reported = true;
+                }
+                let rect = match crop_rect_opt {
+                    Some(rect) => rect,
+                    None => resolve_crop_rect(
+                        &mut crop_rect_opt,
+                        &mut crop_monitor,
+                        host_view(decoded_frame, &mut transferred)?,
+                    ),
+                };
+                let result = if in_place {
+                    device_frames += 1;
+                    match analyzer.analyze_device(decoded_frame, &rect, downscale, analysis_options)
+                    {
+                        Err(error) if !analyzer.context_faulted() => {
+                            // Rejected before any CUDA work, so the context is healthy and the
+                            // frame can still be downloaded and analyzed from host memory.
+                            eprintln!(
+                                "\nNVDEC frame {frame_count} was not analyzed in place ({error:#}); downloading frames to host memory from now on"
+                            );
+                            device_frames_blocked = Some("in-place analysis was rejected");
+                            let host = host_view(decoded_frame, &mut transferred)?;
+                            analyzer.analyze(host, &rect, downscale, analysis_options)
+                        }
+                        other => other,
+                    }
+                } else {
+                    let host = host_view(decoded_frame, &mut transferred)?;
+                    analyzer.analyze(host, &rect, downscale, analysis_options)
+                };
+                match result {
                     Ok(result) => gpu_output = Some((result, rect)),
+                    // A failed CUDA call can leave the context the NVDEC decoder shares unusable,
+                    // and FFmpeg's CUDA download can then report success for a failed copy. No
+                    // later frame can be trusted, so stop instead of falling back.
+                    Err(error)
+                        if analyzer.context_faulted()
+                            && decoded_frame.format() == format::Pixel::CUDA =>
+                    {
+                        return Err(error.context(format!(
+                            "CUDA analysis failed at frame {frame_count}; the NVDEC decoder shares this CUDA context, so the run stops. Rerun with --hwaccel none to analyze on the CPU"
+                        )));
+                    }
                     Err(error) => {
                         eprintln!(
                             "\nCUDA analysis failed at frame {frame_count} ({error:#}); switching to CPU analysis"
@@ -678,6 +963,7 @@ fn run_native_analysis_pipeline(
             let (frame_result, rect) = if let Some((result, rect)) = gpu_output {
                 (result, rect)
             } else {
+                let host_frame = host_view(decoded_frame, &mut transferred)?;
                 let needs_scaling =
                     host_frame.format() != format::Pixel::YUV420P10LE || downscale > 1;
                 let analysis_frame: &frame::Video = if needs_scaling {
@@ -697,34 +983,34 @@ fn run_native_analysis_pipeline(
                 analysis_duration += start.elapsed();
             }
 
-            let cut_sample_frame: &frame::Video = if used_gpu || !used_scaled {
-                host_frame
-            } else {
-                &scaled_frame
-            };
-
-            // Scene detection on analyzed frames
+            // Scene boundaries are chosen after the loop (`detect_scene_cuts`). Here a large
+            // frame-to-frame distance only marks a likely scene change at which the crop
+            // monitor takes a sample. Every final cut exceeds this distance too, but the
+            // samples are rate-limited, so they are telemetry, not one per boundary.
             if let Some(ref prev_hist) = previous_histogram {
                 let raw_diff =
                     compute_scene_diff(cli, &frame_result.frame.lum_histogram, prev_hist);
-                let diff_for_threshold = if smoothing_window > 0 {
-                    diff_window.push_back(raw_diff);
-                    if diff_window.len() > smoothing_window {
-                        diff_window.pop_front();
-                    }
-                    let sum: f64 = diff_window.iter().sum();
-                    sum / (diff_window.len() as f64)
-                } else {
-                    raw_diff
-                };
-
-                if diff_for_threshold > cli.scene_threshold
-                    && cut_allowed(Some(last_cut_frame), frame_count, cli.min_scene_length)
+                // Without crop monitoring (--no-crop) nothing reads the pixels, so an NVDEC
+                // frame is not downloaded.
+                if crop_monitor.is_some()
+                    && raw_diff > cli.scene_threshold
+                    && cut_allowed(
+                        Some(last_crop_sample_frame),
+                        frame_count,
+                        cli.min_scene_length,
+                    )
                 {
-                    scene_cuts.push(frame_count);
-                    last_cut_frame = frame_count;
+                    last_crop_sample_frame = frame_count;
+                    let cut_sample_frame: &frame::Video = if used_gpu || !used_scaled {
+                        host_view(decoded_frame, &mut transferred)?
+                    } else {
+                        &scaled_frame
+                    };
                     sample_scene_cut_crop(&mut crop_monitor, rect, cut_sample_frame);
                 }
+            }
+            if transferred.is_some() {
+                host_downloads += 1;
             }
             previous_histogram = Some(frame_result.frame.lum_histogram.clone());
             last_analyzed_frame = Some(copy_frame(&frame_result.frame));
@@ -752,6 +1038,13 @@ fn run_native_analysis_pipeline(
 
     for (stream, packet) in input_context.packets() {
         if stream.index() == video_stream_index {
+            let data = packet.data().unwrap_or_default();
+            // For HEVC only packets with a slice are pictures (not an end-of-sequence packet).
+            let picture = match leading_scan.as_mut() {
+                Some(scan) => scan.observe_packet(data),
+                None => !data.is_empty(),
+            };
+            stream_pictures += u64::from(picture);
             decoder
                 .send_packet(&packet)
                 .context("Failed to send packet to decoder")?;
@@ -775,10 +1068,28 @@ fn run_native_analysis_pipeline(
     // Finalize progress display
     pb.finish_with_message("Complete");
 
+    let stream_frames = account_stream_frames(
+        stream_pictures,
+        u64::from(frame_count),
+        leading_scan.as_ref(),
+    )?;
+
+    if device_frames > 0 {
+        println!(
+            "CUDA in-place analysis: {device_frames} NVDEC frames; {host_downloads} downloaded to host memory (crop sampling or fallback)"
+        );
+    }
+
     if let Some(monitor) = crop_monitor {
         monitor.report();
     }
 
+    let (scene_cuts, _, _) = detect_scene_cuts(
+        &frames,
+        cli.sample_rate,
+        cli.scene_threshold,
+        cli.min_scene_length,
+    );
     let scenes = convert_scene_cuts_to_scenes(scene_cuts, frame_count);
     println!(
         "Scene detection completed: {} scenes detected",
@@ -814,8 +1125,68 @@ fn run_native_analysis_pipeline(
         );
     }
 
-    let crop = crop_rect_opt.unwrap_or_else(|| CropRect::full(target_w, target_h));
-    Ok((scenes, frames, l1_measurements, frame_peak_stats, crop))
+    // The GPU path keeps its crop in full-resolution coordinates; the CPU path (including a
+    // mid-run fallback, which shrinks the rect) keeps downscaled analysis coordinates.
+    let gpu_active = gpu_analyzer.is_some();
+    let crop = if gpu_active {
+        crop_rect_opt.unwrap_or_else(|| CropRect::full(full_w, full_h))
+    } else {
+        crop_to_full_resolution(
+            crop_rect_opt.unwrap_or_else(|| CropRect::full(target_w, target_h)),
+            downscale,
+            (target_w, target_h),
+            (full_w, full_h),
+        )
+    };
+    Ok((
+        scenes,
+        frames,
+        l1_measurements,
+        frame_peak_stats,
+        crop,
+        gpu_active,
+        stream_frames,
+    ))
+}
+
+/// Pictures of the video stream against the frames the decoder output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StreamFrames {
+    /// Access units (coded pictures) in the video stream.
+    pub stream: u64,
+    /// RASL pictures at the start that no decoder outputs; measured frame `i` is stream frame
+    /// `i + leading_skipped` in presentation order.
+    pub leading_skipped: u64,
+}
+
+/// Every picture of the stream must be either measured or one of the explained undecodable
+/// leading pictures; any other loss would shift per-frame measurements against the video.
+fn account_stream_frames(
+    stream_pictures: u64,
+    decoded: u64,
+    leading_scan: Option<&LeadingPictureScan>,
+) -> Result<StreamFrames> {
+    let leading_skipped = leading_scan.map_or(0, LeadingPictureScan::skipped);
+    if decoded + leading_skipped != stream_pictures {
+        let start = match leading_scan {
+            Some(scan) if !scan.starts_with_irap() => {
+                " The stream does not start with a random access picture (IDR/CRA/BLA): it was cut in the middle of a GOP."
+            }
+            _ => "",
+        };
+        anyhow::bail!(
+            "The decoder output {decoded} frames for {stream_pictures} pictures in the video stream, and only {leading_skipped} of the missing pictures are undecodable leading (RASL) pictures at the start.{start} Measurements would not line up with the video frames, so none are written."
+        );
+    }
+    if leading_skipped > 0 {
+        println!(
+            "The stream starts with {leading_skipped} undecodable leading (RASL) picture(s) (an open-GOP cut at a CRA picture); measured frame 0 is stream frame {leading_skipped}."
+        );
+    }
+    Ok(StreamFrames {
+        stream: stream_pictures,
+        leading_skipped,
+    })
 }
 
 fn fix_scene_end_frames(scenes: &mut [MadVRScene], total_frames: usize) {
@@ -878,18 +1249,9 @@ fn smooth_average(
 fn apply_histogram_smoothing_pass(
     scenes: &[MadVRScene],
     frames: &mut [MadVRFrame],
-    l1_measurements: &mut [FrameL1Measurement],
     cli: &Cli,
     peak_domain: PeakDomain,
 ) -> Result<()> {
-    if frames.len() != l1_measurements.len() {
-        anyhow::bail!(
-            "L1 smoothing frame count mismatch: {} frames, {} measurements",
-            frames.len(),
-            l1_measurements.len()
-        );
-    }
-
     println!(
         "Applying histogram smoothing (EMA beta={}, temporal median window={})...",
         cli.hist_bin_ema_beta, cli.hist_temporal_median
@@ -923,17 +1285,11 @@ fn apply_histogram_smoothing_pass(
         let mut ema_state = vec![0.0; 256];
         let mut temporal_history: VecDeque<Vec<f64>> = VecDeque::with_capacity(temporal_window);
         let mut luma_avg_ema_state: Option<f64> = None;
-        let mut max_rgb_avg_ema_state: Option<f64> = None;
         let mut luma_avg_history: VecDeque<f64> = VecDeque::with_capacity(temporal_window);
-        let mut max_rgb_avg_history: VecDeque<f64> = VecDeque::with_capacity(temporal_window);
 
-        for (frame, l1_measurement) in frames[start_idx..end_idx]
-            .iter_mut()
-            .zip(l1_measurements[start_idx..end_idx].iter_mut())
-        {
+        for frame in frames[start_idx..end_idx].iter_mut() {
             let direct_max_pq = frame.peak_pq_2020;
             let direct_luma_avg_pq = frame.avg_pq;
-            let direct_max_rgb_avg_pq = l1_measurement.avg_max_rgb_pq;
 
             if ema_beta > 0.0 {
                 apply_histogram_ema(&mut frame.lum_histogram, &mut ema_state, ema_beta);
@@ -955,19 +1311,14 @@ fn apply_histogram_smoothing_pass(
 
             frame.peak_pq_2020 = select_peak_pq(&frame.lum_histogram, direct_max_pq, peak_source);
 
-            // Smooth both true per-pixel average domains identically. The first
-            // frame of every scene initializes each EMA without zero-state bias.
+            // Only the madVR frame average is smoothed (it feeds the .bin and the optimizer).
+            // The L1 sidecar keeps the unfiltered per-frame means in `FrameL1Measurement`: a
+            // forward-only EMA pulls a scene mean toward the scene's first frames. The first
+            // frame of every scene initializes the EMA without zero-state bias.
             frame.avg_pq = smooth_average(
                 direct_luma_avg_pq,
                 &mut luma_avg_ema_state,
                 &mut luma_avg_history,
-                ema_beta,
-                temporal_window,
-            );
-            l1_measurement.avg_max_rgb_pq = smooth_average(
-                direct_max_rgb_avg_pq,
-                &mut max_rgb_avg_ema_state,
-                &mut max_rgb_avg_history,
                 ema_beta,
                 temporal_window,
             );
@@ -1006,20 +1357,6 @@ fn precompute_scene_stats(scenes: &mut [MadVRScene], frames: &[MadVRFrame]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn average_smoothing_is_identical_across_domains() {
-        let mut luma_ema = None;
-        let mut max_rgb_ema = None;
-        let mut luma_history = VecDeque::new();
-        let mut max_rgb_history = VecDeque::new();
-
-        for value in [0.1, 0.4, 0.2, 0.8] {
-            let luma = smooth_average(value, &mut luma_ema, &mut luma_history, 0.1, 3);
-            let max_rgb = smooth_average(value, &mut max_rgb_ema, &mut max_rgb_history, 0.1, 3);
-            assert_eq!(luma, max_rgb);
-        }
-    }
 
     #[test]
     fn average_smoothing_has_no_scene_initialization_bias() {

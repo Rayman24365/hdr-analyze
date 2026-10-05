@@ -1,13 +1,15 @@
 use std::path::PathBuf;
 
+use clap::builder::{PossibleValuesParser, TypedValueParser};
 use clap::{Parser, ValueEnum};
+use dovi84_composer::Composer;
 
 /// Version string advertising compiled-in optional backends; mkvdovi probes
 /// `--version` for "+cuda" to decide whether GPU analysis is available.
 #[cfg(feature = "cuda")]
-const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (+cuda)");
+pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (+cuda)");
 #[cfg(not(feature = "cuda"))]
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
 pub enum PeakEstimator {
@@ -26,6 +28,18 @@ pub enum PeakDomain {
     MaxRgb,
     /// Y' (luma) PQ signal.
     Luma,
+}
+
+/// Transfer function to analyze with.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum TransferOverride {
+    /// Detect from the stream and the first decoded frame.
+    #[default]
+    Auto,
+    /// Treat the input as PQ (SMPTE ST 2084).
+    Pq,
+    /// Treat the input as HLG (ARIB STD-B67) and measure through the Dolby Vision 8.4 decode.
+    Hlg,
 }
 
 // --- Command Line Interface ---
@@ -55,24 +69,44 @@ pub struct Cli {
     #[arg(long)]
     pub hwaccel: Option<String>,
 
+    /// Transfer function: auto (detect), pq or hlg. Overrides detection for inputs whose tags
+    /// the linked FFmpeg cannot see (e.g. HLG signalled only in the MKV colour element).
+    #[arg(long, value_enum, default_value_t = TransferOverride::Auto)]
+    pub transfer: TransferOverride,
+
+    /// Dolby Vision Profile 8.4 composer HLG is measured through; must match the composer the
+    /// RPU carries. bt2100 (default): fitted to the BT.2100 1000-nit HLG-to-PQ conversion,
+    /// neutrals kept neutral; preset: the dolby_vision crate's Profile 8.4 preset (what dovi_tool
+    /// writes). Accepted and ignored for PQ input.
+    #[arg(
+        long,
+        value_name = "COMPOSER",
+        default_value = Composer::Bt2100V1.cli_name(),
+        value_parser = PossibleValuesParser::new(Composer::ALL.map(Composer::cli_name))
+            .map(|name| Composer::from_cli_name(&name).expect("a listed composer name")),
+    )]
+    pub hlg_composer: Composer,
+
     /// madVR measurement file version to write (5 or 6). Default: 5
     #[arg(long, default_value_t = 5)]
     pub madvr_version: u8,
 
-    /// Scene detection threshold (distance metric). Default: 0.3
-    #[arg(long, default_value_t = 0.3)]
+    /// Smallest histogram distance (0-200) that can be a scene cut. A cut must also stand out
+    /// from the local frame-to-frame level, so grain and motion do not need a higher value.
+    #[arg(long, default_value_t = 3.0)]
     pub scene_threshold: f64,
 
     /// Scene detection metric: 'hist' (histogram distance) or 'hybrid' (prototype; histogram fused with flow)
     #[arg(long, default_value = "hist")]
     pub scene_metric: String,
 
-    /// Minimum scene length in frames. Cuts closer than this are dropped. Default: 24
-    #[arg(long, default_value_t = 24)]
+    /// Minimum scene length in frames. Of two cuts closer than this the stronger one is kept.
+    #[arg(long, default_value_t = 12)]
     pub min_scene_length: u32,
 
-    /// Optional smoothing window (in frames) over the scene-change metric. 0 disables smoothing.
-    #[arg(long, default_value_t = 5)]
+    /// Ignored. Accepted so existing command lines keep working; the detector no longer
+    /// averages the scene-change metric.
+    #[arg(long, default_value_t = 5, hide = true)]
     pub scene_smoothing: u32,
 
     /// Optional override for header.target_peak_nits (used for v6). If omitted, defaults to computed maxCLL.
@@ -114,7 +148,8 @@ pub struct Cli {
     pub peak_source: Option<String>,
 
     /// Domain used by direct peak measurement: max-rgb or luma.
-    /// Defaults to max-rgb for PQ/unspecified input; HLG always uses luma.
+    /// Defaults to max-rgb. For HLG, max-rgb is measured on the full Dolby Vision 8.4 decode
+    /// (luma curve + chroma MMR + RPU matrix); luma uses the 8.4 luma curve alone.
     #[arg(long, value_enum)]
     pub peak_domain: Option<PeakDomain>,
 
@@ -157,10 +192,6 @@ pub struct Cli {
     /// EMA alpha for target_nits smoothing (0.0-1.0). Lower = more smoothing. Default: 0.2
     #[arg(long, default_value_t = 0.2)]
     pub smoother_alpha: f64,
-
-    /// Peak luminance (nits) used when analyzing HLG content (default: 1000.0)
-    #[arg(long, default_value_t = 1000.0)]
-    pub hlg_peak_nits: f64,
 
     /// Header MaxCLL source: max (direct max), histogram99 (99th percentile), histogram999 (99.9th percentile)
     /// Only affects header.maxcll; per-frame peaks use --peak-source.

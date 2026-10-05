@@ -40,7 +40,7 @@ const W: usize = 320;
 const H: usize = 180;
 const FRAMES: usize = 48;
 
-/// Encode arbitrary limited-range planes as lossless yuv420p10le.
+/// Encode arbitrary limited-range planes as lossless PQ-tagged yuv420p10le.
 fn encode_yuv_plane_clip(
     dir: &std::path::Path,
     label: &str,
@@ -48,7 +48,31 @@ fn encode_yuv_plane_clip(
     cb_plane: &[u16],
     cr_plane: &[u16],
 ) -> std::path::PathBuf {
-    assert_eq!(y_plane.len(), W * H);
+    encode_tagged_yuv_plane_clip(dir, label, y_plane, cb_plane, cr_plane, "smpte2084")
+}
+
+/// Encode arbitrary limited-range planes as lossless yuv420p10le with the given transfer tag.
+fn encode_tagged_yuv_plane_clip(
+    dir: &std::path::Path,
+    label: &str,
+    y_plane: &[u16],
+    cb_plane: &[u16],
+    cr_plane: &[u16],
+    color_trc: &str,
+) -> std::path::PathBuf {
+    let y_planes = vec![y_plane; FRAMES];
+    encode_tagged_yuv_sequence(dir, label, &y_planes, cb_plane, cr_plane, color_trc)
+}
+
+/// Encode one luma plane per frame (chroma planes shared) as lossless yuv420p10le.
+fn encode_tagged_yuv_sequence(
+    dir: &std::path::Path,
+    label: &str,
+    y_planes: &[&[u16]],
+    cb_plane: &[u16],
+    cr_plane: &[u16],
+    color_trc: &str,
+) -> std::path::PathBuf {
     assert_eq!(cb_plane.len(), W * H / 4);
     assert_eq!(cr_plane.len(), W * H / 4);
     let out = dir.join(format!("{label}.mkv"));
@@ -69,7 +93,7 @@ fn encode_yuv_plane_clip(
             "-color_primaries",
             "bt2020",
             "-color_trc",
-            "smpte2084",
+            color_trc,
             "-colorspace",
             "bt2020nc",
             "-color_range",
@@ -81,7 +105,7 @@ fn encode_yuv_plane_clip(
             "-color_primaries",
             "bt2020",
             "-color_trc",
-            "smpte2084",
+            color_trc,
             "-colorspace",
             "bt2020nc",
             "-color_range",
@@ -93,19 +117,15 @@ fn encode_yuv_plane_clip(
         .spawn()
         .expect("spawn ffmpeg");
 
-    let mut frame = Vec::with_capacity(W * H * 3);
-    for y_code in y_plane {
-        frame.extend_from_slice(&y_code.to_le_bytes());
-    }
-    for cb_code in cb_plane {
-        frame.extend_from_slice(&cb_code.to_le_bytes());
-    }
-    for cr_code in cr_plane {
-        frame.extend_from_slice(&cr_code.to_le_bytes());
-    }
     {
         let stdin = child.stdin.as_mut().expect("ffmpeg stdin");
-        for _ in 0..FRAMES {
+        let mut frame = Vec::with_capacity(W * H * 3);
+        for y_plane in y_planes {
+            assert_eq!(y_plane.len(), W * H);
+            frame.clear();
+            for code in y_plane.iter().chain(cb_plane).chain(cr_plane) {
+                frame.extend_from_slice(&code.to_le_bytes());
+            }
             stdin.write_all(&frame).expect("write frame");
         }
     }
@@ -204,7 +224,7 @@ fn analyze_with_peak_dump(dir: &std::path::Path, label: &str, clip: &std::path::
         .split(',')
         .map(|value| value.parse::<f64>().expect("numeric frame stat"))
         .collect();
-    assert_eq!(values.len(), 8);
+    assert_eq!(values.len(), 12);
     PeakDump {
         selected_code: values[1] * 4095.0,
         raw_code: values[2] * 4095.0,
@@ -383,6 +403,163 @@ fn grain_estimator_handles_chroma_and_multiplicative_linear_noise() {
         linear.robust_code
     );
     assert!(linear.raw_code > linear.robust_code + 2.0 * linear.sigma_code);
+}
+
+/// Flat highlights on a grainy picture, in one shot: on the first and the last frame, as a
+/// one-frame flash, as a three-frame specular and as a small static specular. The robust
+/// estimator must keep each at its constructed value while it still corrects the grain on
+/// the frames without a highlight. The one-frame flash is brighter than the other highlights,
+/// so the shot peak shows that this single frame sets it.
+///
+/// The grain is drawn from a fixed seed. The estimator is steep where the fitted width is
+/// close to sigma: in a simulation of this plateau with other seeds about 1 frame in 11
+/// misses the tolerance below (by up to 2 sigma). A change of frame size, frame count or
+/// generator can therefore fail this test without a change of the estimator.
+#[test]
+fn robust_keeps_flat_highlights_on_grain_and_corrects_the_rest() {
+    if !have_ffmpeg() {
+        eprintln!("Skipping: ffmpeg not found in PATH");
+        return;
+    }
+
+    const CLIP_FRAMES: usize = 24;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sigma_10 = 4.0_f64;
+    let plateau_y = clamp_limited_10bit(nits_to_pq(200.0) * 876.0 + 64.0);
+    let highlight_y = clean_1000_nit_code();
+    let flash_y = highlight_y + 40;
+    const FLASH_FRAME: usize = 5;
+    let plateau_code = expected_peak_code(plateau_y);
+    let highlight_code = expected_peak_code(highlight_y);
+    let flash_code = expected_peak_code(flash_y);
+    let sigma_12 = sigma_10 * 4095.0 / 876.0;
+    assert!(highlight_code - plateau_code > 20.0 * sigma_12);
+
+    // (frames, block side): highlight on the first frame, a one-frame flash, a three-frame
+    // 8x8 specular, a static 2x2 specular, and a highlight on the last frame.
+    let highlights: [(std::ops::RangeInclusive<usize>, usize); 5] = [
+        (0..=0, 2),
+        (FLASH_FRAME..=FLASH_FRAME, 2),
+        (9..=11, 8),
+        (15..=19, 2),
+        (CLIP_FRAMES - 1..=CLIP_FRAMES - 1, 2),
+    ];
+    let block_side = |frame: usize| {
+        highlights
+            .iter()
+            .find(|(frames, _)| frames.contains(&frame))
+            .map(|h| h.1)
+    };
+
+    let mut rng = XorShift64Star::new(0xC0DE_F1A5_4000);
+    let planes: Vec<Vec<u16>> = (0..CLIP_FRAMES)
+        .map(|frame| {
+            let mut plane: Vec<u16> = (0..W * H)
+                .map(|_| clamp_limited_10bit(f64::from(plateau_y) + sigma_10 * rng.normal()))
+                .collect();
+            if let Some(side) = block_side(frame) {
+                let value = if frame == FLASH_FRAME {
+                    flash_y
+                } else {
+                    highlight_y
+                };
+                for y in 100..100 + side {
+                    for x in 200..200 + side {
+                        plane[y * W + x] = value;
+                    }
+                }
+            }
+            plane
+        })
+        .collect();
+    let plane_refs: Vec<&[u16]> = planes.iter().map(Vec::as_slice).collect();
+    let neutral = vec![512_u16; W * H / 4];
+    let clip = encode_tagged_yuv_sequence(
+        dir.path(),
+        "grain_highlights",
+        &plane_refs,
+        &neutral,
+        &neutral,
+        "smpte2084",
+    );
+
+    let analyze = |estimator: &str| {
+        let bin = dir.path().join(format!("grain_highlights_{estimator}.bin"));
+        let output = Command::new(env!("CARGO_BIN_EXE_hdr_analyzer_mvp"))
+            .arg(&clip)
+            .arg("-o")
+            .arg(&bin)
+            .args(["--peak-source", "max", "--peak-estimator", estimator])
+            .args(["--disable-optimizer", "--no-crop"])
+            .output()
+            .expect("run analyzer");
+        assert!(
+            output.status.success(),
+            "analyzer failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let data = std::fs::read(&bin).expect("read measurements");
+        let measurements =
+            madvr_parse::MadVRMeasurements::parse_measurements(&data).expect("parse measurements");
+        let peaks: Vec<f64> = measurements
+            .frames
+            .iter()
+            .map(|frame| frame.peak_pq_2020 * 4095.0)
+            .collect();
+        let bin_shot_peak_nits = measurements
+            .scenes
+            .iter()
+            .map(|scene| scene.peak_nits)
+            .max()
+            .expect("at least one scene in the measurements");
+        let sidecar: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(sidecar_path(&bin)).expect("read L1 sidecar"))
+                .expect("parse L1 sidecar");
+        let shot_peak = sidecar["scenes"]
+            .as_array()
+            .expect("sidecar scenes")
+            .iter()
+            .map(|scene| scene["max_pq_12bit"].as_u64().expect("scene max"))
+            .max()
+            .expect("at least one scene");
+        (peaks, shot_peak, bin_shot_peak_nits)
+    };
+
+    let (raw, _, _) = analyze("max");
+    let (robust, shot_peak, bin_shot_peak_nits) = analyze("robust");
+    assert_eq!(robust.len(), CLIP_FRAMES);
+    // Same tolerance as the whole-frame grain fixtures.
+    let grain_tolerance = 2.0 + 0.5 * sigma_12;
+    for (frame, (&robust, &raw)) in robust.iter().zip(&raw).enumerate() {
+        if block_side(frame).is_some() {
+            let expected = if frame == FLASH_FRAME {
+                flash_code
+            } else {
+                highlight_code
+            };
+            assert!(
+                (robust - expected).abs() < 0.25,
+                "frame {frame}: highlight {expected} read as {robust}"
+            );
+        } else {
+            assert!(
+                raw - plateau_code > 2.0 * sigma_12,
+                "frame {frame}: raw {raw} must overshoot the plateau {plateau_code}"
+            );
+            assert!(
+                (robust - plateau_code).abs() <= grain_tolerance,
+                "frame {frame}: robust {robust}, plateau {plateau_code}, raw {raw}"
+            );
+        }
+    }
+    assert!(flash_code - highlight_code > 100.0);
+    assert_eq!(shot_peak, flash_code.round() as u64);
+    // The scene record of the measurement file takes the same maximum of frame peaks.
+    let flash_nits = pq_to_nits(flash_code / 4095.0);
+    assert!(
+        (f64::from(bin_shot_peak_nits) - flash_nits).abs() <= 2.0,
+        "scene peak {bin_shot_peak_nits} nits, flash {flash_nits} nits"
+    );
 }
 
 #[test]
@@ -687,4 +864,173 @@ fn raised_black_minimum_preserves_floor_and_rejects_sparse_dark_noise() {
             .all(|code| *code == 0),
         "absolute minimum must expose the dark speckle"
     );
+}
+
+/// DV Profile 8.4 luma curve at a 10-bit code, re-derived independently of the analyzer
+/// from the `dolby_vision` crate's Profile 8.4 constants (coefficients int + frac/2^23).
+fn dovi84_reference_pq(code: u16) -> f64 {
+    const INT: [[f64; 3]; 8] = [
+        [-1.0, 1.0, -3.0],
+        [-1.0, 1.0, -2.0],
+        [0.0, 0.0, -1.0],
+        [0.0, 0.0, 0.0],
+        [0.0, -2.0, 1.0],
+        [6.0, -14.0, 8.0],
+        [13.0, -30.0, 16.0],
+        [28.0, -62.0, 34.0],
+    ];
+    const FRAC: [[f64; 3]; 8] = [
+        [7978928.0, 8332855.0, 4889184.0],
+        [8269552.0, 5186604.0, 3909327.0],
+        [1317527.0, 5338528.0, 7440486.0],
+        [2119979.0, 2065496.0, 2288524.0],
+        [7982780.0, 5409990.0, 1585336.0],
+        [3460436.0, 3197328.0, 615464.0],
+        [3921968.0, 6820672.0, 5546752.0],
+        [1947392.0, 1244640.0, 6094272.0],
+    ];
+    const PIVOTS: [f64; 9] = [63.0, 132.0, 362.0, 618.0, 874.0, 911.0, 927.0, 935.0, 942.0];
+    let s = f64::from(code) / 1023.0;
+    let k = (0..8).rev().find(|&k| s >= PIVOTS[k] / 1023.0).unwrap_or(0);
+    let c: Vec<f64> = (0..3)
+        .map(|j| INT[k][j] + FRAC[k][j] / 8_388_608.0)
+        .collect();
+    let y = (c[0] + c[1] * s + c[2] * s * s).clamp(PIVOTS[0] / 1023.0, PIVOTS[8] / 1023.0);
+    ((y - 0.0625) * 9574.0 / 8192.0).clamp(62.0 / 4095.0, 3079.0 / 4095.0)
+}
+
+#[test]
+fn hlg_flat_frame_measures_through_dovi84_curve() {
+    if !have_ffmpeg() {
+        eprintln!("Skipping: ffmpeg not found in PATH");
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let y_code = 721_u16;
+    let clip = encode_tagged_yuv_plane_clip(
+        dir.path(),
+        "hlg_721",
+        &vec![y_code; W * H],
+        &vec![512; W * H / 4],
+        &vec![512; W * H / 4],
+        "arib-std-b67",
+    );
+    let bin = dir.path().join("hlg_721.bin");
+    let output = Command::new(env!("CARGO_BIN_EXE_hdr_analyzer_mvp"))
+        .arg(&clip)
+        .arg("-o")
+        .arg(&bin)
+        .args(["--peak-source", "max", "--disable-optimizer", "--no-crop"])
+        // The preset curve, re-derived independently below; bt2100 has its own test.
+        .args(["--hlg-composer", "preset"])
+        .output()
+        .expect("run analyzer");
+    assert!(
+        output.status.success(),
+        "analyzer failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Dolby Vision Profile 8.4"),
+        "HLG detection message missing"
+    );
+
+    let sidecar: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(sidecar_path(&bin)).expect("read L1 sidecar"))
+            .expect("parse L1 sidecar");
+    assert_eq!(sidecar["version"], 5);
+    assert_eq!(sidecar["analysis"]["luminance_mapping"], "dovi84-v2");
+    assert_eq!(sidecar["peak_domain"], "max-rgb");
+
+    // Luma: 721 → ~208.5 nits through the 8.4 curve (BT.2100 OOTF would give ~203).
+    let expected_luma = dovi84_reference_pq(y_code) * 4095.0;
+    // Max-RGB of the full 8.4 decode: the preset's chroma MMR tints neutral grey slightly blue,
+    // so B' exceeds luma. Reference: libplacebo's Dolby Vision render of this exact sample.
+    let expected_max_rgb = 2439.1;
+    let scenes = sidecar["scenes"].as_array().expect("scenes array");
+    assert!(!scenes.is_empty());
+    for scene in scenes {
+        let max_code = scene["max_pq_12bit"].as_f64().expect("scene max");
+        assert!(
+            (max_code - expected_max_rgb).abs() <= 1.0,
+            "scene max_pq_12bit {max_code} != DV 8.4 max-RGB reference {expected_max_rgb}"
+        );
+        let avg_rgb = scene["avg_max_rgb_pq_12bit"]
+            .as_f64()
+            .expect("scene avg max-RGB");
+        assert!(
+            (avg_rgb - expected_max_rgb).abs() <= 1.0,
+            "scene avg_max_rgb_pq_12bit {avg_rgb} != DV 8.4 max-RGB reference {expected_max_rgb}"
+        );
+        let avg_code = scene["avg_luma_pq_12bit"].as_f64().expect("scene avg");
+        assert!(
+            (avg_code - expected_luma).abs() <= 1.0,
+            "scene avg_luma_pq_12bit {avg_code} != DV 8.4 reference {expected_luma}"
+        );
+    }
+
+    // A flat frame: MaxCLL and MaxFALL are both the patch's max-RGB light level.
+    let expected_nits = pq_to_nits(expected_max_rgb / 4095.0);
+    for field in ["max_cll_nits", "max_fall_nits"] {
+        let nits = sidecar["light_level"][field].as_f64().expect(field);
+        assert!(
+            (nits - expected_nits).abs() <= 1.0,
+            "light_level.{field} {nits} != {expected_nits:.1} nits"
+        );
+    }
+}
+
+#[test]
+fn hlg_flat_frame_measures_through_the_bt2100_composer() {
+    if !have_ffmpeg() {
+        eprintln!("Skipping: ffmpeg not found in PATH");
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let y_code = 721_u16;
+    let clip = encode_tagged_yuv_plane_clip(
+        dir.path(),
+        "hlg_721_bt2100",
+        &vec![y_code; W * H],
+        &vec![512; W * H / 4],
+        &vec![512; W * H / 4],
+        "arib-std-b67",
+    );
+    let bin = dir.path().join("hlg_721_bt2100.bin");
+    let output = Command::new(env!("CARGO_BIN_EXE_hdr_analyzer_mvp"))
+        .arg(&clip)
+        .arg("-o")
+        .arg(&bin)
+        .args(["--peak-source", "max", "--disable-optimizer", "--no-crop"])
+        .args(["--hlg-composer", "bt2100"])
+        .output()
+        .expect("run analyzer");
+    assert!(
+        output.status.success(),
+        "analyzer failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let sidecar: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(sidecar_path(&bin)).expect("read L1 sidecar"))
+            .expect("parse L1 sidecar");
+    assert_eq!(sidecar["version"], 5);
+    assert_eq!(sidecar["analysis"]["luminance_mapping"], "dovi84-bt2100-v1");
+
+    // The fitted composer decodes 75% neutral grey to 2378.6 on all three channels
+    // (BT.2100 reference 2378.24, about 203 nits), so luma and max-RGB agree.
+    let expected = 2378.6;
+    let scenes = sidecar["scenes"].as_array().expect("scenes array");
+    assert!(!scenes.is_empty());
+    for scene in scenes {
+        for field in ["max_pq_12bit", "avg_max_rgb_pq_12bit", "avg_luma_pq_12bit"] {
+            let code = scene[field].as_f64().expect(field);
+            assert!(
+                (code - expected).abs() <= 1.0,
+                "scene {field} {code} != BT.2100 composer value {expected}"
+            );
+        }
+    }
 }

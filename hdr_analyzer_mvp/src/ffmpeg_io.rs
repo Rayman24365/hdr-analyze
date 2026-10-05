@@ -20,7 +20,11 @@ const MAX_DECODED_FRAMES_PER_PROBE: usize = 120;
 pub enum TransferFunction {
     Pq,
     Hlg,
+    /// No transfer tag (or a reserved value): analyzed as PQ with a notice.
     Unknown,
+    /// A tagged non-HDR transfer (BT.709, BT.2020 10/12-bit SDR gamma, sRGB, ...). The analyzer
+    /// refuses these: ITU-T H.273 BT2020_10/BT2020_12 share the BT.709 curve, not SMPTE ST 2084.
+    Unsupported(&'static str),
 }
 
 impl fmt::Display for TransferFunction {
@@ -29,6 +33,7 @@ impl fmt::Display for TransferFunction {
             TransferFunction::Pq => write!(f, "PQ (SMPTE 2084)"),
             TransferFunction::Hlg => write!(f, "HLG (ARIB STD-B67)"),
             TransferFunction::Unknown => write!(f, "Unspecified"),
+            TransferFunction::Unsupported(name) => write!(f, "{name} (not an HDR transfer)"),
         }
     }
 }
@@ -37,9 +42,10 @@ impl From<color::TransferCharacteristic> for TransferFunction {
     fn from(value: color::TransferCharacteristic) -> Self {
         use color::TransferCharacteristic::*;
         match value {
-            SMPTE2084 | BT2020_10 | BT2020_12 => TransferFunction::Pq,
+            SMPTE2084 => TransferFunction::Pq,
             ARIB_STD_B67 => TransferFunction::Hlg,
-            _ => TransferFunction::Unknown,
+            Unspecified | Reserved | Reserved0 => TransferFunction::Unknown,
+            other => TransferFunction::Unsupported(other.name().unwrap_or("unknown")),
         }
     }
 }
@@ -51,6 +57,10 @@ pub struct VideoInfo {
     pub height: u32,
     pub total_frames: Option<u32>,
     pub transfer_function: TransferFunction,
+    /// Signalled sample range. The analyzer assumes limited (MPEG) range.
+    pub color_range: color::Range,
+    /// Signalled YCbCr matrix. The analyzer assumes BT.2020 non-constant luminance.
+    pub color_space: color::Space,
 }
 
 fn spread_probe_timestamps(start: i64, duration: i64, count: u32) -> Vec<i64> {
@@ -90,8 +100,11 @@ pub fn probe_crop(input_path: &str, probe_count: u32, downscale: u32) -> Result<
         start => start,
     };
     let stream_duration = video_stream.duration();
-    let decoder_context = codec::context::Context::from_parameters(video_stream.parameters())
+    let mut decoder_context = codec::context::Context::from_parameters(video_stream.parameters())
         .context("failed to create crop probe decoder context")?;
+    // Each probe decodes from the preceding keyframe; with long GOPs that is hundreds of 4K
+    // frames, and libavcodec defaults to a single thread.
+    set_automatic_thread_count(&mut decoder_context);
 
     let duration = if stream_duration != ffmpeg::ffi::AV_NOPTS_VALUE && stream_duration > 0 {
         stream_duration
@@ -159,39 +172,58 @@ pub fn probe_crop(input_path: &str, probe_count: u32, downscale: u32) -> Result<
         let mut decoded_after_target = 0usize;
         let mut candidate = None;
 
-        'packets: for (stream, packet) in input_context.packets() {
-            if stream.index() != stream_index {
-                continue;
-            }
-
-            decoder
-                .send_packet(&packet)
-                .context("failed to send crop probe packet to decoder")?;
-
-            while decoder.receive_frame(&mut decoded_frame).is_ok() {
-                if decoded_frame
+        {
+            // Returns true once this probe is finished: a usable frame, or the frame limit.
+            let mut consider = |decoded: &frame::Video| -> Result<bool> {
+                if decoded
                     .timestamp()
                     .is_some_and(|timestamp| timestamp < target)
                 {
-                    continue;
+                    return Ok(false);
                 }
 
                 decoded_after_target += 1;
                 let analysis_frame = if let Some(ref mut scaler) = scaler {
                     scaler
-                        .run(&decoded_frame, &mut scaled_frame)
+                        .run(decoded, &mut scaled_frame)
                         .context("failed to scale crop probe frame")?;
                     &scaled_frame
                 } else {
-                    &decoded_frame
+                    decoded
                 };
 
                 if is_frame_usable_for_crop(analysis_frame) {
                     candidate = Some(detect_crop(analysis_frame));
-                    break 'packets;
+                    return Ok(true);
                 }
-                if decoded_after_target >= MAX_DECODED_FRAMES_PER_PROBE {
-                    break 'packets;
+                Ok(decoded_after_target >= MAX_DECODED_FRAMES_PER_PROBE)
+            };
+
+            let mut finished = false;
+            'packets: for (stream, packet) in input_context.packets() {
+                if stream.index() != stream_index {
+                    continue;
+                }
+
+                decoder
+                    .send_packet(&packet)
+                    .context("failed to send crop probe packet to decoder")?;
+
+                while decoder.receive_frame(&mut decoded_frame).is_ok() {
+                    if consider(&decoded_frame)? {
+                        finished = true;
+                        break 'packets;
+                    }
+                }
+            }
+
+            // End of file: the decoder still holds its last frames (reordering delay, and more
+            // with frame threading) until it is drained. The next probe's flush resets it.
+            if !finished && decoder.send_eof().is_ok() {
+                while decoder.receive_frame(&mut decoded_frame).is_ok() {
+                    if consider(&decoded_frame)? {
+                        break;
+                    }
                 }
             }
         }
@@ -241,14 +273,26 @@ pub fn get_native_video_info(input_path: &str) -> Result<(VideoInfo, format::con
     // We only read the color_trc field which is a simple integer value.
     // The pointer dereference is safe because Context guarantees the underlying
     // AVCodecContext is valid for the lifetime of the Context object.
-    let transfer_characteristic =
+    let stream_transfer =
         unsafe { color::TransferCharacteristic::from((*decoder_context.as_ptr()).color_trc) };
+    let frame_transfer = first_frame_transfer(input_path);
+    let transfer_characteristic = resolve_transfer(stream_transfer, frame_transfer);
+    if transfer_characteristic != stream_transfer {
+        println!(
+            "Transfer tag: stream reports {}, decoded frames report {} (alternative-transfer SEI or container colour tag); using {}.",
+            stream_transfer.name().unwrap_or("unspecified"),
+            transfer_characteristic.name().unwrap_or("unspecified"),
+            transfer_characteristic.name().unwrap_or("unspecified"),
+        );
+    }
     let decoder = decoder_context
         .decoder()
         .video()
         .context("Failed to create video decoder")?;
     let width = decoder.width();
     let height = decoder.height();
+    let color_range = decoder.color_range();
+    let color_space = decoder.color_space();
 
     // Try multiple methods to estimate frame count
     let frame_count = {
@@ -311,9 +355,57 @@ pub fn get_native_video_info(input_path: &str) -> Result<(VideoInfo, format::con
         height,
         total_frames: frame_count,
         transfer_function,
+        color_range,
+        color_space,
     };
 
     Ok((info, input_context))
+}
+
+/// Transfer characteristic of the first decoded frame, from a short separate decode.
+///
+/// FFmpeg's HEVC decoder applies the alternative transfer characteristics SEI (broadcast HLG
+/// often signals BT.2020 in the VUI and HLG in that SEI) and keeps a container colour tag when
+/// the VUI carries none. The stream-level tag misses both, so the frame-level value is preferred.
+fn first_frame_transfer(input_path: &str) -> Option<color::TransferCharacteristic> {
+    let mut input = format::input(input_path).ok()?;
+    let stream = input.streams().best(media::Type::Video)?;
+    let index = stream.index();
+    let mut decoder = codec::context::Context::from_parameters(stream.parameters())
+        .ok()?
+        .decoder()
+        .video()
+        .ok()?;
+    let mut decoded = frame::Video::empty();
+    for (packet_stream, packet) in input.packets() {
+        if packet_stream.index() != index || decoder.send_packet(&packet).is_err() {
+            continue;
+        }
+        if decoder.receive_frame(&mut decoded).is_ok() {
+            return Some(decoded.color_transfer_characteristic());
+        }
+    }
+    decoder.send_eof().ok()?;
+    decoder.receive_frame(&mut decoded).ok()?;
+    Some(decoded.color_transfer_characteristic())
+}
+
+/// Pick the transfer to analyze with: a decoded frame's PQ/HLG tag wins, then the stream's
+/// PQ/HLG tag, then the stream tag as-is (so non-HDR input is still refused).
+fn resolve_transfer(
+    stream: color::TransferCharacteristic,
+    frame: Option<color::TransferCharacteristic>,
+) -> color::TransferCharacteristic {
+    let is_hdr = |transfer: color::TransferCharacteristic| {
+        matches!(
+            TransferFunction::from(transfer),
+            TransferFunction::Pq | TransferFunction::Hlg
+        )
+    };
+    match frame {
+        Some(frame) if is_hdr(frame) => frame,
+        _ => stream,
+    }
 }
 
 #[cfg(test)]
@@ -322,7 +414,56 @@ mod tests {
 
     use ffmpeg_next as ffmpeg;
 
-    use super::{select_cuda_format, spread_probe_timestamps};
+    use ffmpeg_next::util::color::TransferCharacteristic;
+
+    use super::{resolve_transfer, select_cuda_format, spread_probe_timestamps, TransferFunction};
+
+    #[test]
+    fn frame_level_hdr_transfer_overrides_the_stream_tag() {
+        use TransferCharacteristic::*;
+        // Broadcast HLG: VUI says BT.2020 10-bit, the alternative-transfer SEI says HLG.
+        assert_eq!(
+            resolve_transfer(BT2020_10, Some(ARIB_STD_B67)),
+            ARIB_STD_B67
+        );
+        // Container-only colour tag: the stream reads unspecified, frames carry HLG.
+        assert_eq!(
+            resolve_transfer(Unspecified, Some(ARIB_STD_B67)),
+            ARIB_STD_B67
+        );
+        // A non-HDR frame tag never overrides the stream tag.
+        assert_eq!(resolve_transfer(SMPTE2084, Some(Unspecified)), SMPTE2084);
+        assert_eq!(resolve_transfer(BT709, Some(BT709)), BT709);
+        assert_eq!(resolve_transfer(BT2020_10, None), BT2020_10);
+    }
+
+    #[test]
+    fn transfer_mapping_accepts_only_hdr_curves() {
+        assert_eq!(
+            TransferFunction::from(TransferCharacteristic::SMPTE2084),
+            TransferFunction::Pq
+        );
+        assert_eq!(
+            TransferFunction::from(TransferCharacteristic::ARIB_STD_B67),
+            TransferFunction::Hlg
+        );
+        assert_eq!(
+            TransferFunction::from(TransferCharacteristic::Unspecified),
+            TransferFunction::Unknown
+        );
+        assert!(matches!(
+            TransferFunction::from(TransferCharacteristic::BT2020_10),
+            TransferFunction::Unsupported(_)
+        ));
+        assert!(matches!(
+            TransferFunction::from(TransferCharacteristic::BT2020_12),
+            TransferFunction::Unsupported(_)
+        ));
+        assert!(matches!(
+            TransferFunction::from(TransferCharacteristic::BT709),
+            TransferFunction::Unsupported(_)
+        ));
+    }
 
     #[test]
     fn probe_timestamps_span_the_middle_seventy_percent() {
@@ -414,6 +555,21 @@ pub fn setup_hardware_decoder(
     }
 }
 
+/// Codec extradata of a stream (`hvcC` for HEVC in MKV/MP4), empty when there is none.
+pub fn codec_extradata(parameters: &codec::Parameters) -> Vec<u8> {
+    // SAFETY: parameters wraps a live AVCodecParameters; extradata points to extradata_size
+    // readable bytes whenever it is non-null.
+    unsafe {
+        let raw = parameters.as_ptr();
+        let size = usize::try_from((*raw).extradata_size).unwrap_or(0);
+        if (*raw).extradata.is_null() || size == 0 {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts((*raw).extradata, size).to_vec()
+        }
+    }
+}
+
 pub fn open_software_decoder(parameters: &codec::Parameters) -> Result<codec::decoder::Video> {
     let mut context = codec::context::Context::from_parameters(parameters.clone())
         .context("Failed to create software decoder context")?;
@@ -430,6 +586,11 @@ fn set_automatic_thread_count(context: &mut codec::context::Context) {
         (*context.as_mut_ptr()).thread_count = 0;
     }
 }
+
+/// `AV_CUDA_USE_PRIMARY_CONTEXT` from hwcontext_cuda.h (public API, value stable since
+/// FFmpeg 4.4). Defined here because ffmpeg-sys binds that header only when the CUDA
+/// headers are present at build time.
+const AV_CUDA_USE_PRIMARY_CONTEXT: i32 = 1;
 
 unsafe extern "C" fn select_cuda_format(
     _context: *mut ffmpeg::ffi::AVCodecContext,
@@ -499,13 +660,16 @@ fn open_cuda_hwdevice_decoder(parameters: &codec::Parameters) -> Result<codec::d
         let codec_context = context.as_mut_ptr();
         (*codec_context).get_format = Some(select_cuda_format);
 
+        // Share the device's primary context with the CUDA analyzer, so decoded surfaces
+        // can be analyzed in place (`GpuAnalyzer::analyze_device`). The analyzer is created
+        // first and sets the primary-context flags FFmpeg requires for this.
         let mut device_context = ptr::null_mut();
         let status = ffmpeg::ffi::av_hwdevice_ctx_create(
             &mut device_context,
             ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA,
             ptr::null(),
             ptr::null_mut(),
-            0,
+            AV_CUDA_USE_PRIMARY_CONTEXT,
         );
         if status < 0 || device_context.is_null() {
             if !device_context.is_null() {

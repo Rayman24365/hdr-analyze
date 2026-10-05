@@ -4,13 +4,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use colored::Colorize;
+use dovi84_composer::Composer;
 use serde_json::Value;
 
-use crate::cli::{AnalysisQuality, Args, CmVersion, DoviInput, Encoder, HwAccel, PeakSource};
+use crate::cli::{AnalysisQuality, Args, CmVersion, DoviInput, HwAccel, PeakSource};
 use crate::external::{self, run_command_with_progress, run_command_with_spinner, ToolVersion};
-use crate::fel_composite;
 use crate::metadata::{self, HdrFormat};
 use crate::progress;
 use crate::resume;
@@ -36,6 +36,19 @@ pub(crate) fn feed_mkv_to_dovi_tool(mode: DoviInput, raw_sealed: bool) -> bool {
     mode == DoviInput::Mkv && !raw_sealed
 }
 
+/// Error for Profile 7 FEL inputs. The BL+EL compositor and its re-encode were removed; FEL is
+/// refused until a design that keeps the base layer bit-exact exists (docs/FEL_PLAN.md).
+pub(crate) const FEL_UNSUPPORTED_MESSAGE: &str = "Profile 7 FEL input is not supported: the BL+EL compositor was removed because it did not match the Dolby Vision reconstruction specification. A no-re-encode FEL design is planned (docs/FEL_PLAN.md).";
+
+/// Refuse formats mkvdovi detects but cannot convert. Called before any temp-directory work,
+/// so a refused input leaves no artifacts behind and an old temp directory stays untouched.
+fn reject_unsupported_input(hdr_type: HdrFormat) -> Result<()> {
+    if hdr_type == HdrFormat::DolbyVisionFel {
+        bail!(FEL_UNSUPPORTED_MESSAGE);
+    }
+    Ok(())
+}
+
 pub fn convert_file(input_file: &str, args: &Args) -> Result<bool> {
     let input_path = Path::new(input_file);
     if !input_path.exists() {
@@ -53,7 +66,8 @@ pub fn convert_file(input_file: &str, args: &Args) -> Result<bool> {
     let temp_dir_name = format!("mkvdovi_temp_{}", stem);
     let mut temp_dir = dir.join(&temp_dir_name);
     // Pre-rename compat (mkvdolby -> mkvdovi in v0.3.0): resume from a leftover
-    // `mkvdolby_temp_*` directory when no new-style one exists. Remove after one release.
+    // `mkvdolby_temp_*` directory when no new-style one exists. Such directories predate resume
+    // fingerprints, so they resume through the missing-fingerprint path below.
     if resume_enabled && !temp_dir.exists() {
         let legacy_temp_dir = dir.join(format!("mkvdolby_temp_{}", stem));
         if legacy_temp_dir.exists() {
@@ -61,15 +75,97 @@ pub fn convert_file(input_file: &str, args: &Args) -> Result<bool> {
         }
     }
 
-    // A leftover temp dir means a previous run for this file was interrupted. With resume
-    // enabled we reuse its completed steps; otherwise we discard it and start clean.
-    let resuming = resume_enabled && temp_dir.exists();
-
-    if output_file.exists() && !resuming {
+    // With no leftover temp dir, an existing output means the file is already converted. This is
+    // checked before format detection so that a finished batch is skipped without probing.
+    let warn_output_exists = || {
         progress::print_warn(&format!(
             "Output file '{}' already exists. Skipping.",
             output_file.display()
         ));
+    };
+    if output_file.exists() && !(resume_enabled && temp_dir.exists()) {
+        warn_output_exists();
+        return Ok(true);
+    }
+
+    // Detect the format before the temp directory is created, resumed or discarded: an input
+    // that is refused (Profile 7 FEL, also under --mdfix) must not cause any temp work.
+    let detected_hdr_type = metadata::check_hdr_format(input_file);
+    reject_unsupported_input(detected_hdr_type)?;
+
+    // HLG becomes Profile 8.4 with the base layer copied unchanged, so a stream tagged with
+    // colorimetry the RPU cannot describe is refused here, before any temp work or extraction
+    // (the hevc_metadata filter in the base-layer step writes a BT.2020 NCL matrix tag).
+    let hlg_composer = (detected_hdr_type == HdrFormat::Hlg).then_some(args.hlg_composer);
+    let colour_warnings = if hlg_composer.is_some() {
+        match metadata::check_hlg_colour_contract(input_file) {
+            Ok(warnings) => warnings,
+            Err(refusal) => {
+                progress::print_error(&refusal);
+                return Ok(false);
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let custom_composer = hlg_composer.filter(|&composer| composer != Composer::Preset);
+
+    // A leftover temp dir means a previous run for this file was interrupted. With resume
+    // enabled we reuse its completed steps when it was created for this exact input and these
+    // settings. A directory with no fingerprint was left by an older mkvdovi, so it resumes with
+    // a warning, unless a non-preset HLG composer is selected (its RPU.bin would carry the
+    // preset). A directory with a different fingerprint is discarded.
+    let fingerprint =
+        resume::Fingerprint::for_input(input_path, resume_settings(args, hlg_composer)).ok();
+    let mut resuming = resume_enabled && temp_dir.exists();
+    if resuming && resume::is_legacy_hlg_dir(&temp_dir) {
+        // Only the removed HLG-to-PQ (Profile 8.1) path wrote HLG_to_PQ.mkv. Its PQ base layer and
+        // 8.1 RPU do not fit the Profile 8.4 conversion that replaced it, whatever the fingerprint
+        // says (v0.4.0 already wrote fingerprints for those directories).
+        progress::print_info(&format!(
+            "Leftover temp dir '{}' comes from the removed HLG-to-PQ (Profile 8.1) conversion; starting clean.",
+            temp_dir.display()
+        ));
+        let _ = fs::remove_dir_all(&temp_dir);
+        temp_dir = dir.join(&temp_dir_name);
+        resuming = false;
+    }
+    if resuming {
+        let status = fingerprint
+            .as_ref()
+            .map_or(resume::FingerprintStatus::Differs, |current| {
+                current.check(&temp_dir)
+            });
+        match status {
+            resume::FingerprintStatus::Matches => {}
+            resume::FingerprintStatus::Missing if custom_composer.is_some() => {
+                progress::print_warn(&format!(
+                    "Leftover temp dir '{}' has no resume fingerprint (created by an older mkvdovi), so its RPU may carry another HLG composer than --hlg-composer {}; starting clean.",
+                    temp_dir.display(),
+                    args.hlg_composer.cli_name()
+                ));
+                let _ = fs::remove_dir_all(&temp_dir);
+                temp_dir = dir.join(&temp_dir_name);
+                resuming = false;
+            }
+            resume::FingerprintStatus::Missing => progress::print_warn(&format!(
+                "Leftover temp dir '{}' has no resume fingerprint (created by an older mkvdovi); resuming its completed steps, which may carry metadata from that version. Pass --no-resume to start clean.",
+                temp_dir.display()
+            )),
+            resume::FingerprintStatus::Differs => {
+                progress::print_warn(&format!(
+                    "Leftover temp dir '{}' was created for a different input, settings, or mkvdovi version; starting clean.",
+                    temp_dir.display()
+                ));
+                let _ = fs::remove_dir_all(&temp_dir);
+                temp_dir = dir.join(&temp_dir_name);
+                resuming = false;
+            }
+        }
+    }
+
+    if output_file.exists() && !resuming {
+        warn_output_exists();
         return Ok(true);
     }
 
@@ -91,13 +187,18 @@ pub fn convert_file(input_file: &str, args: &Args) -> Result<bool> {
         let _ = fs::remove_dir_all(&temp_dir);
     }
     fs::create_dir_all(&temp_dir).context("Failed to create temp directory")?;
+    if let Some(fingerprint) = &fingerprint {
+        fingerprint
+            .write(&temp_dir)
+            .context("Failed to write resume fingerprint")?;
+    }
     if resuming {
         progress::print_info("Resuming from a previous run — completed steps will be reused.");
     }
 
     // --- Step 1: Detect HDR format ---
     progress::print_step(1, 0, "Detecting HDR format...");
-    let mut hdr_type = metadata::check_hdr_format(input_file);
+    let mut hdr_type = detected_hdr_type;
     let original_hdr_type = hdr_type;
     let mut measurements_file: Option<PathBuf> = None;
     let mut hdr10plus_json: Option<PathBuf> = None;
@@ -137,6 +238,17 @@ pub fn convert_file(input_file: &str, args: &Args) -> Result<bool> {
         HdrFormat::Unsupported => "Unsupported",
     };
     progress::print_info(&format!("Detected: {}", format_label));
+    for warning in &colour_warnings {
+        progress::print_warn(warning);
+    }
+    if let Some(composer) = custom_composer {
+        progress::print_info(&format!(
+            "HLG composer: {} ({}); not yet confirmed on playback devices. If a display renders \
+             the output wrongly, convert with --hlg-composer preset.",
+            composer.cli_name(),
+            composer.luminance_mapping()
+        ));
+    }
 
     if hdr_type == HdrFormat::Unsupported {
         progress::print_error("Unsupported HDR format. Cannot process this file.");
@@ -145,18 +257,22 @@ pub fn convert_file(input_file: &str, args: &Args) -> Result<bool> {
     }
 
     // Compute total steps based on the detected format
-    let total_steps: u8 = match hdr_type {
+    let mut total_steps: u8 = match hdr_type {
         HdrFormat::Hdr10Plus => 7, // detect, extract HEVC, extract meta, config, RPU, inject, mux
-        HdrFormat::Hlg => 8,       // detect, analyze, HLG→PQ, config, RPU, extract BL, inject, mux
+        HdrFormat::Hlg => 7,       // detect, analyze, config, RPU, extract BL, inject, mux
         HdrFormat::Hdr10WithMeasurements => 6, // detect, config, RPU, extract BL, inject, mux
         HdrFormat::Hdr10Unsupported => 7, // detect, analyze, config, RPU, extract BL, inject, mux
         HdrFormat::DolbyVisionMel => 7,
-        HdrFormat::DolbyVisionFel => 8,
+        HdrFormat::DolbyVisionFel => 0, // unreachable — refused before the temp dir
         HdrFormat::DolbyVisionP8 => 7,
         HdrFormat::Unsupported => 0, // unreachable — handled above
     };
 
     let mut current_step: u8 = 1; // Step 1 (detect) already done
+
+    // Measured L1 sidecar, loaded when existing measurements are reused (validated against the
+    // input) or right after a fresh analyzer run.
+    let mut l1_sidecar: Option<metadata::L1Sidecar> = None;
 
     // --- Format-specific metadata extraction ---
     // Pre-handle HDR10+ to allow fallback to HDR10Unsupported if metadata is missing
@@ -241,28 +357,19 @@ pub fn convert_file(input_file: &str, args: &Args) -> Result<bool> {
             }
             hdr_type = HdrFormat::Hdr10WithMeasurements;
         }
-        HdrFormat::DolbyVisionFel => {
-            progress::print_info("Compositing Profile 7 FEL into a Profile 8.1 base layer.");
-            let composited = fel_composite::convert_fel_to_hdr10(input_file, &temp_dir, args)?;
-            bl_source_file = composited.clone();
-
-            let mut extra_args = Vec::new();
-            add_optimizer_args(&mut extra_args, args);
-            measurements_file =
-                run_hdr_analyzer(composited.to_str().unwrap(), &temp_dir, &extra_args, args)?;
-            if measurements_file.is_none() {
-                progress::print_error(
-                    "Failed to generate measurements from the composited FEL output.",
-                );
-                return Ok(false);
-            }
-            hdr_type = HdrFormat::Hdr10WithMeasurements;
-        }
+        // Refused by reject_unsupported_input before the temp directory was touched.
+        HdrFormat::DolbyVisionFel => bail!(FEL_UNSUPPORTED_MESSAGE),
         HdrFormat::DolbyVisionP8 => {
             if !args.mdfix {
                 progress::print_warn(
                     "Profile 8 input is already converted; use `inspect` or --mdfix to rebuild metadata.",
                 );
+                return Ok(false);
+            }
+
+            // A Profile 8.4 base layer is HLG; rebuilding it would put a PQ (8.1) RPU on it.
+            if metadata::has_hlg_transfer(input_file) {
+                progress::print_error("Profile 8.4 (HLG base layer) --mdfix is not supported yet.");
                 return Ok(false);
             }
 
@@ -287,56 +394,81 @@ pub fn convert_file(input_file: &str, args: &Args) -> Result<bool> {
             }
             hdr_type = HdrFormat::Hdr10WithMeasurements;
         }
-        HdrFormat::Hlg => {
-            // HLG Logic
-            current_step += 1;
-            progress::print_step(
-                current_step,
-                total_steps,
-                &format!(
-                    "Generating measurements (HLG, --hlg-peak-nits={})...",
-                    args.hlg_peak_nits
-                ),
-            );
-
-            let mut extra_args = vec![
-                "--hlg-peak-nits".to_string(),
-                args.hlg_peak_nits.to_string(),
-            ];
-            add_optimizer_args(&mut extra_args, args);
-
-            measurements_file = run_hdr_analyzer(input_file, &temp_dir, &extra_args, args)?;
-            if measurements_file.is_none() {
+        HdrFormat::Hdr10WithMeasurements | HdrFormat::Hdr10Unsupported | HdrFormat::Hlg => {
+            // HLG goes to Profile 8.4: the base layer is the untouched source, and L1 must be
+            // measured through the Dolby Vision 8.4 reconstruction of the selected composer
+            // (sidecar v3+, `Composer::luminance_mapping`).
+            let hlg = hdr_type == HdrFormat::Hlg;
+            if hlg && args.legacy_madvr_l1 {
+                progress::print_error(
+                    "--legacy-madvr-l1 is not supported for HLG input: Profile 8.4 needs L1 measured through the Dolby Vision 8.4 mapping.",
+                );
                 return Ok(false);
             }
+            // Reuse existing measurements only when their L1 sidecar is valid for this input
+            // (or the user explicitly asked for the legacy optimizer-target path). Every
+            // candidate is tried in turn, so a stale shared file cannot shadow a valid one.
+            let candidates = metadata::measurements_candidates(input_path);
+            let reuse = if args.legacy_madvr_l1 {
+                measurements_file = candidates.into_iter().next();
+                measurements_file.is_some()
+            } else if candidates.is_empty() {
+                false
+            } else {
+                let expect = metadata::SidecarExpectation::for_input(
+                    input_path,
+                    metadata::get_frame_count(input_file),
+                )
+                .with_hlg_composer(hlg_composer);
+                let mut reused = false;
+                for existing in candidates {
+                    match metadata::load_l1_sidecar(&existing, &expect) {
+                        Ok((sidecar, advisories)) => {
+                            report_reused_sidecar(&sidecar, &existing, args);
+                            print_sidecar_advisories(&advisories);
+                            l1_sidecar = Some(sidecar);
+                            measurements_file = Some(existing);
+                            reused = true;
+                            break;
+                        }
+                        Err(error) => progress::print_warn(&format!(
+                            "Existing measurements '{}' cannot be reused ({error}).",
+                            existing.display()
+                        )),
+                    }
+                }
+                if !reused {
+                    progress::print_info("No reusable measurements found; re-running analysis.");
+                }
+                reused
+            };
 
-            // Convert HLG -> PQ for Base Layer
-            current_step += 1;
-            progress::print_step(current_step, total_steps, "Converting HLG to PQ...");
-            match convert_hlg_to_pq(input_file, &temp_dir, args, resume_enabled) {
-                Ok(path) => bl_source_file = path,
-                Err(_) => return Ok(false),
-            }
-        }
-        HdrFormat::Hdr10WithMeasurements | HdrFormat::Hdr10Unsupported => {
-            // Try finding measurements
-            measurements_file = metadata::find_measurements_file(input_path);
-
-            if measurements_file.is_some() {
+            if reuse {
+                if hlg {
+                    // HLG's step count assumes a fresh analysis.
+                    total_steps -= 1;
+                }
                 progress::print_info("Using existing measurements file.");
                 if args.boost_experimental {
                     progress::print_warn(
                         "Experimental boost requested, but using existing measurements.",
                     );
                 }
-            } else if hdr_type == HdrFormat::Hdr10WithMeasurements {
-                // Should have found it
-                progress::print_error("Expected madVR measurements file not found.");
-                return Ok(false);
             } else {
                 // Generate them
+                if hdr_type == HdrFormat::Hdr10WithMeasurements {
+                    total_steps += 1;
+                }
                 current_step += 1;
-                progress::print_step(current_step, total_steps, "Generating measurements...");
+                progress::print_step(
+                    current_step,
+                    total_steps,
+                    if hlg {
+                        "Generating measurements (HLG via the Dolby Vision 8.4 mapping)..."
+                    } else {
+                        "Generating measurements..."
+                    },
+                );
 
                 let mut extra_args = Vec::new();
                 if args.boost_experimental {
@@ -345,6 +477,28 @@ pub fn convert_file(input_file: &str, args: &Args) -> Result<bool> {
                         .extend(["--optimizer-profile".to_string(), "aggressive".to_string()]);
                 } else {
                     add_optimizer_args(&mut extra_args, args);
+                }
+                if hlg {
+                    // MediaInfo classified the input as HLG; the analyzer's linked FFmpeg may not
+                    // see the tag (e.g. HLG only in the MKV colour element), so state it.
+                    extra_args.extend(["--transfer".to_string(), "hlg".to_string()]);
+                }
+                if let Some(composer) = hlg_composer {
+                    // Always name the composer: the analyzer's own default may differ from the
+                    // one this run writes. An analyzer that predates the option measures through
+                    // the preset only.
+                    if external::analyzer_lists_option(&analyzer_executable(), "--hlg-composer") {
+                        extra_args
+                            .extend(["--hlg-composer".to_string(), composer.cli_name().into()]);
+                    } else if composer != Composer::Preset {
+                        progress::print_error(&format!(
+                            "--hlg-composer {} needs an hdr_analyzer_mvp whose --help lists \
+                             --hlg-composer; rebuild or update the analyzer, or convert with \
+                             --hlg-composer preset.",
+                            composer.cli_name()
+                        ));
+                        return Ok(false);
+                    }
                 }
                 measurements_file = run_hdr_analyzer(input_file, &temp_dir, &extra_args, args)?;
                 if measurements_file.is_none() {
@@ -367,7 +521,11 @@ pub fn convert_file(input_file: &str, args: &Args) -> Result<bool> {
     );
 
     // Static Metadata
-    let static_meta = metadata::get_static_metadata(input_file);
+    // MaxCLL / MaxFALL are resolved after the L1 sidecar is loaded: measured values fill what the
+    // source does not state.
+    let hlg_source = hdr_type == HdrFormat::Hlg;
+    let mut static_meta = metadata::read_static_metadata(input_file);
+    metadata::apply_static_defaults(&mut static_meta, &["max_dml", "min_dml"], hlg_source);
 
     // Build CM v4.0 config if enabled
     let cm_v40_config = if args.cm_version == CmVersion::V40 {
@@ -421,24 +579,102 @@ pub fn convert_file(input_file: &str, args: &Args) -> Result<bool> {
         .filter_map(|s| s.trim().parse().ok())
         .collect();
 
-    // Prefer source-honest per-scene L1 from the analyzer sidecar when it exists. Without it,
-    // dovi_tool's madVR path fills L1 avg with a fixed placeholder and (with custom targets)
-    // replaces L1 max with optimizer targets.
-    let l1_sidecar = measurements_file
-        .as_deref()
-        .and_then(metadata::load_l1_sidecar);
-    if l1_sidecar.is_some() {
-        progress::print_info(
-            "Using measured L1 sidecar: source-honest per-scene min/avg/max in the RPU.",
-        );
-    } else if measurements_file.is_some() {
-        progress::print_warn(
-            "No L1 sidecar next to the measurements file; falling back to legacy madVR-file generation.",
-        );
+    // Source-honest per-scene L1 from the analyzer sidecar is mandatory for measurement-based
+    // generation. dovi_tool's madVR path fills L1 avg with a fixed placeholder and (with custom
+    // targets) replaces L1 max with optimizer targets, so it is reachable only by explicit opt-in.
+    if let Some(measurements) = measurements_file.as_deref() {
+        if args.legacy_madvr_l1 {
+            l1_sidecar = None;
+            progress::print_warn(
+                "--legacy-madvr-l1: L1 max comes from optimizer targets and L1 avg is a placeholder, not measured values.",
+            );
+        } else if l1_sidecar.is_none() {
+            // Freshly produced by the analyzer in this run: validate structure and, for HLG, the
+            // luminance mapping (an older analyzer binary would measure without it). The frame
+            // count is the analyzer's own: a v5 sidecar accounts for every picture of the stream
+            // it demuxed, while MediaInfo can report a count estimated from the duration or
+            // copied from stale statistics tags. The inject step still refuses an RPU whose
+            // length differs from the video.
+            let expect = metadata::SidecarExpectation::default().with_hlg_composer(hlg_composer);
+            match metadata::load_l1_sidecar(measurements, &expect) {
+                Ok((sidecar, advisories)) => {
+                    print_sidecar_advisories(&advisories);
+                    l1_sidecar = Some(sidecar);
+                }
+                Err(error) if hdr_type == HdrFormat::Hlg => {
+                    let required = if custom_composer.is_some() {
+                        "`--transfer` and `--hlg-composer`"
+                    } else {
+                        "`--transfer`"
+                    };
+                    progress::print_error(&format!(
+                        "The analyzer's L1 sidecar cannot be used for Profile 8.4 ({error}). The analyzer did not measure through the selected Dolby Vision 8.4 HLG composer, so it is probably an older build: `hdr_analyzer_mvp --help` must list {required}."
+                    ));
+                    return Ok(false);
+                }
+                Err(error) => {
+                    progress::print_error(&format!(
+                        "The analyzer's L1 sidecar is unusable ({error}). Refusing to fall back to optimizer-derived L1; pass --legacy-madvr-l1 to force it."
+                    ));
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    if let Some(sidecar) = &l1_sidecar {
+        progress::print_info(&format!(
+            "Using measured L1 sidecar ({}): source-honest per-scene min/avg/max in the RPU.",
+            sidecar.provenance_summary()
+        ));
+        // Offsets sampled from a source RPU keep precedence; otherwise describe the same active
+        // area the measurements were taken over.
+        if level5_offsets.is_none() {
+            if let Some(offsets) = metadata::level5_from_sidecar(sidecar) {
+                progress::print_info(&format!(
+                    "L5 active area from the committed crop: left {}, right {}, top {}, bottom {}.",
+                    offsets.left, offsets.right, offsets.top, offsets.bottom
+                ));
+                level5_offsets = Some(offsets);
+            }
+        }
     }
 
+    let dv_profile =
+        match metadata::dv_profile_for(hdr_type, l1_sidecar.as_ref(), args.hlg_composer) {
+            Ok(profile) => profile,
+            Err(error) => {
+                progress::print_error(&format!(
+                    "Cannot choose the Dolby Vision profile: {error:#}"
+                ));
+                return Ok(false);
+            }
+        };
+    if dv_profile != "8.1" {
+        progress::print_info(&format!(
+            "Generating Dolby Vision Profile {dv_profile} (base layer kept bit-exact)."
+        ));
+    }
+
+    for message in metadata::resolve_light_levels(&mut static_meta, l1_sidecar.as_ref(), hlg_source)
+    {
+        progress::print_info(&message);
+    }
+
+    // Profile 8.1 states the mastering range explicitly; dovi_tool's own L6 lookup gets every
+    // master other than 1000/2000/4000/10000 nits (and min 0.0001/0.005 nits) wrong.
+    let source_range = metadata::expected_source_range(dv_profile, &static_meta);
+    if source_range.is_none() {
+        progress::print_warn(&format!(
+            "Mastering display luminance (min {} nits, max {} nits) is not plausible; dovi_tool derives the source range from L6.",
+            static_meta.get("min_dml").copied().unwrap_or(f64::NAN),
+            static_meta.get("max_dml").copied().unwrap_or(f64::NAN)
+        ));
+    }
+
+    let previous_config = fs::read(&extra_json_path).ok();
     metadata::generate_extra_json(
         &extra_json_path,
+        dv_profile,
         &static_meta,
         &final_trims,
         cm_v40_config.as_ref(),
@@ -446,6 +682,21 @@ pub fn convert_file(input_file: &str, args: &Args) -> Result<bool> {
         l1_sidecar.as_ref(),
     )?;
     progress::print_info("Configuration written.");
+    // The resume fingerprint does not cover the measurements. An RPU built from an earlier
+    // configuration (for example before a re-analysis changed L1) must not be reused.
+    if resume_enabled && previous_config != fs::read(&extra_json_path).ok() {
+        let stale = [temp_dir.join("RPU.bin"), temp_dir.join("BL_RPU.hevc")];
+        if stale.iter().any(|artifact| resume::is_complete(artifact)) {
+            progress::print_warn(
+                "The generation settings differ from the interrupted run; regenerating the RPU instead of reusing it.",
+            );
+        }
+        for artifact in &stale {
+            resume::invalidate(artifact)?;
+        }
+        // A muxed output from that run carries the old RPU too.
+        let _ = fs::remove_file(temp_dir.join("mux.done"));
+    }
 
     // --- Generate RPU ---
     current_step += 1;
@@ -457,6 +708,7 @@ pub fn convert_file(input_file: &str, args: &Args) -> Result<bool> {
         hdr10plus_json.as_deref(),
         measurements_file.as_deref(),
         l1_sidecar.is_some(),
+        custom_composer,
         resume_enabled,
     )?;
 
@@ -469,8 +721,8 @@ pub fn convert_file(input_file: &str, args: &Args) -> Result<bool> {
     current_step += 1;
     progress::print_step(current_step, total_steps, "Extracting base layer...");
 
-    // When the BL source is already a raw Annex B HEVC stream in the temp dir (mdfix and FEL
-    // paths), re-extracting it with ffmpeg would just duplicate ~the full video size on disk.
+    // When the BL source is already a raw Annex B HEVC stream in the temp dir (mdfix paths),
+    // re-extracting it with ffmpeg would just duplicate ~the full video size on disk.
     let bl_hevc = if bl_source_file.extension().is_some_and(|ext| ext == "hevc") {
         progress::print_info("Base layer is already a raw HEVC stream; skipping re-extraction.");
         bl_source_file.clone()
@@ -492,11 +744,19 @@ pub fn convert_file(input_file: &str, args: &Args) -> Result<bool> {
                 "0:v:0",
                 "-c:v",
                 "copy",
-                "-f",
-                "hevc",
-                "-y",
-                bl_hevc.to_str().unwrap(),
             ]);
+            if hdr_type == HdrFormat::Hlg && metadata::hlg_bitstream_lacks_transfer(input_file) {
+                // Lossless SPS/VUI edit (slices untouched): without an HLG tag in the bitstream
+                // mkvmerge would give the Profile 8.4 track compatibility ID 2 (SDR) instead of 4.
+                progress::print_info(
+                    "HLG is tagged only in the container; writing the HLG transfer into the HEVC VUI.",
+                );
+                ffmpeg_cmd.args([
+                    "-bsf:v",
+                    "hevc_metadata=colour_primaries=9:transfer_characteristics=18:matrix_coefficients=9",
+                ]);
+            }
+            ffmpeg_cmd.args(["-f", "hevc", "-y", bl_hevc.to_str().unwrap()]);
 
             let bl_total = fs::metadata(&bl_source_file).ok().map(|m| m.len());
             if !run_command_with_progress(
@@ -549,6 +809,23 @@ pub fn convert_file(input_file: &str, args: &Args) -> Result<bool> {
             args.stall_timeout,
         )? {
             return Ok(false);
+        }
+        // dovi_tool repeats or drops RPUs at the end when the RPU and the stream differ in
+        // length, so measurements no longer line up with the pictures they were taken from.
+        let inject_log = fs::read_to_string(temp_dir.join("dovi_inject.log")).unwrap_or_default();
+        if let Some(line) = inject_log
+            .lines()
+            .find(|line| line.contains("mismatched lengths"))
+        {
+            if measurements_file.is_some() {
+                progress::print_error(&format!(
+                    "dovi_tool inject-rpu: {}. The measured RPU does not match the video picture for picture; refusing to mux it.",
+                    line.trim().trim_start_matches("Warning: ")
+                ));
+                let _ = fs::remove_file(&bl_rpu_hevc);
+                return Ok(false);
+            }
+            progress::print_warn(&format!("dovi_tool inject-rpu: {}", line.trim()));
         }
         resume::mark_done(&bl_rpu_hevc)?;
 
@@ -610,6 +887,14 @@ pub fn convert_file(input_file: &str, args: &Args) -> Result<bool> {
             measurements_file_path.as_deref(),
             &temp_dir,
             expected_cm,
+            hlg_composer,
+            Some(crate::verify::DeliveryExpectation {
+                // dovi_tool takes L1 from the HDR10+ metadata when it is given, never the shots.
+                l1_sidecar: l1_sidecar
+                    .as_ref()
+                    .filter(|_| hdr_type != HdrFormat::Hdr10Plus),
+                source_range,
+            }),
         );
         if !ok {
             progress::print_error("Inconsistencies detected during verification.");
@@ -650,6 +935,39 @@ pub fn convert_file(input_file: &str, args: &Args) -> Result<bool> {
         );
     }
     Ok(true)
+}
+
+/// Settings that change the artifacts a temp directory holds. Part of the resume fingerprint.
+///
+/// The removed `--hlg-peak-nits` flag left no token: the fingerprint also records the mkvdovi
+/// version, so v0.4.0 temp dirs are discarded anyway. Fingerprint-less legacy HLG temp dirs are
+/// discarded separately by `resume::is_legacy_hlg_dir`.
+///
+/// `hlg_composer` is `Some` for HLG inputs. The composer changes `RPU.bin` but not `extra.json`, so
+/// the fingerprint must carry it. It is appended only when it is not the preset: a fingerprint is
+/// compared as a whole, so an unconditional token would discard every temp dir left by an earlier
+/// build of this version, and the composer is irrelevant for other inputs.
+fn resume_settings(args: &Args, hlg_composer: Option<Composer>) -> String {
+    let mut settings = format!(
+        "hwaccel={:?} analysis_quality={:?} optimizer={:?} boost={} boost_experimental={} cm={:?} content_type={:?} reference_mode={} source_primaries={:?} trim_targets={} peak_source={:?} mdfix={} legacy_madvr_l1={}",
+        args.hwaccel,
+        args.analysis_quality,
+        args.optimizer_profile,
+        args.boost,
+        args.boost_experimental,
+        args.cm_version,
+        args.content_type,
+        args.reference_mode,
+        args.source_primaries,
+        args.trim_targets,
+        args.peak_source,
+        args.mdfix,
+        args.legacy_madvr_l1,
+    );
+    if let Some(composer) = hlg_composer.filter(|&composer| composer != Composer::Preset) {
+        settings.push_str(&format!(" hlg_composer={}", composer.luminance_mapping()));
+    }
+    settings
 }
 
 fn output_path_for(input_path: &Path, mdfix: bool) -> PathBuf {
@@ -1000,7 +1318,7 @@ pub fn resolve_auto_settings(args: &mut Args) {
         if external::detect_nvidia_gpu() {
             args.hwaccel = HwAccel::Cuda;
             progress::print_info(
-                "Auto-detected NVIDIA GPU: CUDA acceleration enabled (decode + analysis; NVENC for re-encodes).",
+                "Auto-detected NVIDIA GPU: CUDA acceleration enabled (GPU decode + analysis).",
             );
         } else {
             args.hwaccel = HwAccel::None;
@@ -1069,6 +1387,46 @@ fn run_hdr_analyzer(
         return Ok(Some(out_path));
     }
     Ok(None)
+}
+
+/// Print the advisory warnings that came back with a valid L1 sidecar.
+fn print_sidecar_advisories(advisories: &[String]) {
+    for advisory in advisories {
+        progress::print_warn(advisory);
+    }
+}
+
+/// Print provenance for reused measurements and warn when they are coarser than the
+/// resolved --analysis-quality preset.
+fn report_reused_sidecar(sidecar: &metadata::L1Sidecar, measurements: &Path, args: &Args) {
+    progress::print_info(&format!(
+        "Existing measurements provenance: {}",
+        sidecar.provenance_summary()
+    ));
+    let (downscale, sample_rate) = analysis_quality_args(args.analysis_quality);
+    let wanted = (
+        downscale.parse::<u32>().unwrap_or(1),
+        sample_rate.parse::<u32>().unwrap_or(1),
+    );
+    match &sidecar.analysis {
+        Some(analysis) if analysis.downscale > wanted.0 || analysis.sample_rate > wanted.1 => {
+            progress::print_warn(&format!(
+                "Existing measurements were analyzed at downscale {} / sample-rate {}, coarser than --analysis-quality {} (downscale {} / sample-rate {}). Delete '{}' to re-analyze.",
+                analysis.downscale,
+                analysis.sample_rate,
+                format!("{:?}", args.analysis_quality).to_lowercase(),
+                wanted.0,
+                wanted.1,
+                measurements.display()
+            ));
+        }
+        Some(_) => {}
+        None => progress::print_warn(&format!(
+            "Existing measurements carry no analysis provenance (sidecar v{}); delete '{}' to re-analyze with the current analyzer.",
+            sidecar.version,
+            measurements.display()
+        )),
+    }
 }
 
 fn analysis_quality_args(quality: AnalysisQuality) -> (&'static str, &'static str) {
@@ -1249,147 +1607,6 @@ fn extract_hdr10plus_metadata(
     Ok(None)
 }
 
-fn convert_hlg_to_pq(input: &str, temp_dir: &Path, args: &Args, resume: bool) -> Result<PathBuf> {
-    let out_path = temp_dir.join("HLG_to_PQ.mkv");
-    if resume && resume::is_complete(&out_path) {
-        progress::print_info("Reusing HLG\u{2192}PQ base layer from a previous run.");
-        return Ok(out_path);
-    }
-    let log_path = temp_dir.join("ffmpeg_hlg2pq.log");
-
-    let static_meta = metadata::get_static_metadata(input);
-    let max_dml = *static_meta.get("max_dml").unwrap_or(&1000.0) as u32;
-    let min_dml = static_meta.get("min_dml").unwrap_or(&0.005);
-    let max_cll = *static_meta.get("max_cll").unwrap_or(&1000.0) as u32;
-    let max_fall = *static_meta.get("max_fall").unwrap_or(&400.0) as u32;
-
-    let min_dml_int = (min_dml * 10000.0) as u32;
-    let max_dml_int = max_dml * 10000;
-
-    let master_display = format!(
-        "G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)L({},{})",
-        max_dml_int, min_dml_int
-    );
-
-    let x265_params = format!(
-        "colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:master-display={}:max-cll={},{}:hdr-opt=1:repeat-headers=1",
-        master_display, max_cll, max_fall
-    );
-
-    let npl = args.hlg_peak_nits;
-    let vf = format!(
-        "zscale=transferin=arib-std-b67:transfer=smpte2084:primaries=bt2020:matrix=bt2020nc:rangein=tv:range=tv:npl={},format=yuv420p10le",
-        npl
-    );
-
-    let mut cmd = Command::new("ffmpeg");
-    cmd.args([
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-stats",
-        "-i",
-        input,
-        "-y",
-        "-map",
-        "0:v:0",
-        "-an",
-        "-sn",
-        "-vf",
-        &vf,
-    ]);
-
-    if args.hwaccel == HwAccel::Cuda && external::ffmpeg_has_encoder("hevc_nvenc") {
-        cmd.args([
-            "-c:v",
-            "hevc_nvenc",
-            "-preset",
-            "p7",
-            "-tune",
-            "hq",
-            "-rc",
-            "constqp",
-            "-qp",
-            "19",
-            "-pix_fmt",
-            "yuv420p10le",
-            "-profile:v",
-            "main10",
-        ]);
-
-        cmd.args([
-            "-color_primaries",
-            "bt2020",
-            "-color_trc",
-            "smpte2084",
-            "-colorspace",
-            "bt2020nc",
-            "-color_range",
-            "tv",
-        ]);
-    } else {
-        if args.hwaccel == HwAccel::Cuda {
-            progress::print_warn(
-                "ffmpeg lacks hevc_nvenc; using the configured software encoder instead.",
-            );
-        }
-        match args.encoder {
-            Encoder::Libx265 => {
-                cmd.args([
-                    "-c:v",
-                    "libx265",
-                    "-preset",
-                    &args.hlg_preset,
-                    "-crf",
-                    &args.hlg_crf.to_string(),
-                    "-pix_fmt",
-                    "yuv420p10le",
-                    "-profile:v",
-                    "main10",
-                    "-x265-params",
-                    &x265_params,
-                ]);
-            }
-            Encoder::HevcVideotoolbox => {
-                cmd.args([
-                    "-c:v",
-                    "hevc_videotoolbox",
-                    "-allow_sw",
-                    "1",
-                    "-profile:v",
-                    "main10",
-                    "-pix_fmt",
-                    "p010le",
-                    "-color_primaries",
-                    "bt2020",
-                    "-color_trc",
-                    "smpte2084",
-                    "-colorspace",
-                    "bt2020nc",
-                    "-q:v",
-                    "65",
-                ]);
-            }
-        }
-    }
-
-    cmd.arg(out_path.to_str().unwrap());
-
-    if run_command_with_progress(
-        &mut cmd,
-        &log_path,
-        "Converting HLG to PQ (encoding)",
-        &out_path,
-        None,
-        args.stall_timeout,
-    )? && out_path.exists()
-    {
-        resume::mark_done(&out_path)?;
-        return Ok(out_path);
-    }
-    anyhow::bail!("HLG to PQ conversion failed")
-}
-
 fn generate_rpu(
     hdr_type: HdrFormat,
     temp_dir: &Path,
@@ -1397,6 +1614,7 @@ fn generate_rpu(
     meta_file: Option<&Path>,
     meas_file: Option<&Path>,
     embedded_l1_shots: bool,
+    custom_composer: Option<Composer>,
     resume: bool,
 ) -> Result<Option<PathBuf>> {
     let rpu_out = temp_dir.join("RPU.bin");
@@ -1432,17 +1650,33 @@ fn generate_rpu(
     }
 
     let log_path = temp_dir.join("dovi_gen.log");
-    if run_command_with_spinner(&mut cmd, &log_path, "Generating Dolby Vision RPU")? {
-        resume::mark_done(&rpu_out)?;
-        Ok(Some(rpu_out))
-    } else {
-        Ok(None)
+    if !run_command_with_spinner(&mut cmd, &log_path, "Generating Dolby Vision RPU")? {
+        return Ok(None);
     }
+    // dovi_tool always writes the preset composer. Install the selected one before the sentinel,
+    // so an interrupted or failed rewrite is never reused as a finished RPU.
+    if let Some(composer) = custom_composer {
+        let frames = dovi84_composer::rewrite_rpu_file(&rpu_out, composer).with_context(|| {
+            format!(
+                "installing the {} HLG composer into {}",
+                composer.cli_name(),
+                rpu_out.display()
+            )
+        })?;
+        progress::print_info(&format!(
+            "Installed the {} HLG composer ({}) on {frames} RPU frames.",
+            composer.cli_name(),
+            composer.luminance_mapping()
+        ));
+    }
+    resume::mark_done(&rpu_out)?;
+    Ok(Some(rpu_out))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use serde_json::json;
 
     #[test]
@@ -1451,6 +1685,26 @@ mod tests {
         assert_eq!(analysis_quality_args(AnalysisQuality::Balanced), ("2", "1"));
         assert_eq!(analysis_quality_args(AnalysisQuality::Accurate), ("1", "1"));
         assert_eq!(analysis_quality_args(AnalysisQuality::Auto), ("2", "1"));
+    }
+
+    #[test]
+    fn profile7_fel_input_is_refused() {
+        let error = reject_unsupported_input(HdrFormat::DolbyVisionFel).unwrap_err();
+        assert_eq!(error.to_string(), FEL_UNSUPPORTED_MESSAGE);
+        assert!(FEL_UNSUPPORTED_MESSAGE.starts_with("Profile 7 FEL input is not supported"));
+        assert!(FEL_UNSUPPORTED_MESSAGE.contains("docs/FEL_PLAN.md"));
+
+        for supported in [
+            HdrFormat::Hdr10Plus,
+            HdrFormat::Hlg,
+            HdrFormat::Hdr10WithMeasurements,
+            HdrFormat::Hdr10Unsupported,
+            HdrFormat::DolbyVisionMel,
+            HdrFormat::DolbyVisionP8,
+            HdrFormat::Unsupported,
+        ] {
+            assert!(reject_unsupported_input(supported).is_ok());
+        }
     }
 
     #[test]
@@ -1510,6 +1764,28 @@ mod tests {
         let peak_nits = hdr10plus_peak_nits(&scene, PeakSource::MaxSclLuminance).unwrap();
 
         assert!((peak_nits - 179.66).abs() < 1e-9);
+    }
+
+    #[test]
+    fn resume_settings_carry_only_a_non_preset_hlg_composer() {
+        let preset = Args::try_parse_from(["mkvdovi", "--hlg-composer", "preset"]).unwrap();
+        let bt2100 = Args::try_parse_from(["mkvdovi"]).unwrap();
+
+        // Preset fingerprints stay what 0.5.1 wrote (its RPUs carry the preset), so those temp
+        // dirs still resume under --hlg-composer preset and are discarded under bt2100.
+        let default = resume_settings(&preset, None);
+        assert_eq!(
+            default,
+            "hwaccel=Auto analysis_quality=Auto optimizer=Conservative boost=false boost_experimental=false cm=V40 content_type=Movies reference_mode=false source_primaries=None trim_targets=100,600,1000 peak_source=Histogram mdfix=false legacy_madvr_l1=false"
+        );
+        assert_eq!(resume_settings(&preset, Some(Composer::Preset)), default);
+        // The composer only matters for HLG inputs.
+        assert_eq!(resume_settings(&bt2100, None), default);
+        // bt2100 differs from the preset both ways, so neither reuses the other's RPU.bin.
+        assert_eq!(
+            resume_settings(&bt2100, Some(Composer::Bt2100V1)),
+            format!("{default} hlg_composer=dovi84-bt2100-v1")
+        );
     }
 
     #[test]

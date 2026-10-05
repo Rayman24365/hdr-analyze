@@ -46,28 +46,16 @@ pub fn run_command(cmd: &mut Command, log_path: &Path) -> Result<bool> {
     writeln!(writer, "Running command: {:?}", cmd)?;
     writer.flush()?;
 
-    // Redirect stderr to stdout to capture everything
+    // wait_with_output drains stdout and stderr concurrently, so a child that writes more
+    // than a pipe buffer (64 KB on Linux) cannot block. The pipes must stay on `child`:
+    // taking them out first leaves nothing to drain them, and the child and this process
+    // then wait on each other forever.
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-
-    // Actually, std::process::Command doesn't support "stderr -> stdout" fd redirection easily without shell.
-    // Better to pipe both.
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-
-    let mut child = cmd.spawn().context("Failed to spawn command")?;
-
-    let _stdout = child.stdout.take().expect("Failed to open stdout");
-    let _stderr = child.stderr.take().expect("Failed to open stderr");
-
-    // We want to stream both to the log file.
-    // We can use threads to drive this.
-
-    // Simplification: For non-live commands, just wait_with_output is easier,
-    // but we want to log it potentially.
-    // Let's use wait_with_output for simple commands and dump to file.
-
-    let output = child.wait_with_output()?;
+    let output = cmd
+        .spawn()
+        .context("Failed to spawn command")?
+        .wait_with_output()?;
 
     writer.write_all(&output.stdout)?;
     writer.write_all(&output.stderr)?;
@@ -98,15 +86,14 @@ pub fn run_command_with_spinner(cmd: &mut Command, log_path: &Path, message: &st
     writeln!(writer, "Running command: {:?}", cmd)?;
     writer.flush()?;
 
+    // Same pipe handling as `run_command`: leave the pipes on the child so
+    // wait_with_output drains both and a verbose tool cannot deadlock.
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-
-    let mut child = cmd.spawn().context("Failed to spawn command")?;
-
-    let _stdout = child.stdout.take().expect("Failed to open stdout");
-    let _stderr = child.stderr.take().expect("Failed to open stderr");
-
-    let output = child.wait_with_output()?;
+    let output = cmd
+        .spawn()
+        .context("Failed to spawn command")?
+        .wait_with_output()?;
 
     writer.write_all(&output.stdout)?;
     writer.write_all(&output.stderr)?;
@@ -129,7 +116,7 @@ pub fn run_command_with_spinner(cmd: &mut Command, log_path: &Path, message: &st
 /// stops growing for `stall_secs` seconds (`0` disables the stall check).
 ///
 /// This is the robust replacement for `run_command_with_spinner` on steps that move many
-/// gigabytes (extract / inject / mux / encode): the bytes + throughput + ETA readout makes
+/// gigabytes (extract / inject / mux): the bytes + throughput + ETA readout makes
 /// a slow-but-working step distinguishable from a hung one.
 pub fn run_command_with_progress(
     cmd: &mut Command,
@@ -386,21 +373,18 @@ pub fn detect_nvidia_gpu() -> bool {
         .unwrap_or(false)
 }
 
-/// Check whether the ffmpeg on PATH provides a given encoder (e.g. "hevc_nvenc").
-pub fn ffmpeg_has_encoder(name: &str) -> bool {
-    get_command_output(Command::new("ffmpeg").args(["-hide_banner", "-encoders"]))
-        .map(|out| {
-            out.lines()
-                .any(|line| line.split_whitespace().nth(1) == Some(name))
-        })
-        .unwrap_or(false)
-}
-
 /// Check whether an hdr_analyzer_mvp binary was built with the CUDA analysis
 /// backend (its --version output advertises "+cuda").
 pub fn analyzer_has_cuda_feature(exe: &Path) -> bool {
     get_command_output(Command::new(exe).arg("--version"))
         .map(|out| out.contains("+cuda"))
+        .unwrap_or(false)
+}
+
+/// Whether the analyzer's `--help` lists `option` (probe for options added after 0.5.1).
+pub fn analyzer_lists_option(exe: &Path, option: &str) -> bool {
+    get_command_output(Command::new(exe).arg("--help"))
+        .map(|out| out.contains(option))
         .unwrap_or(false)
 }
 
@@ -489,6 +473,38 @@ pub fn run_command_inherit_stderr(cmd: &mut Command, log_path: &Path) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A child that writes far more than a pipe buffer to both streams. Before the fix,
+    /// `run_command` held the pipes without reading them and this never returned.
+    #[cfg(unix)]
+    fn chatty_command(exit_code: i32) -> Command {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(format!(
+            "head -c 300000 /dev/zero | tr '\\0' o; head -c 300000 /dev/zero | tr '\\0' e >&2; exit {exit_code}"
+        ));
+        cmd
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_drains_large_output_into_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("chatty.log");
+        assert!(run_command(&mut chatty_command(0), &log).unwrap());
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(text.contains(&"o".repeat(300_000)));
+        assert!(text.contains(&"e".repeat(300_000)));
+        assert!(!run_command(&mut chatty_command(3), &log).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_with_spinner_drains_large_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("chatty.log");
+        assert!(run_command_with_spinner(&mut chatty_command(0), &log, "chatty").unwrap());
+        assert!(std::fs::metadata(&log).unwrap().len() >= 600_000);
+    }
 
     #[test]
     fn parses_plain_tool_versions() {

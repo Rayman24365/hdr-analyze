@@ -1,6 +1,16 @@
-# Validation Report — Base-Layer Measurement Accuracy
+# Validation report: base-layer measurement accuracy
 
-**Analyzer version:** hdr_analyzer_mvp 0.3.0 · **Date:** 2026-07-06 (§1–§6), 2026-07-08 (§7) · **Rule:** accuracy is
+## Three kinds of evidence
+
+The project keeps three questions apart. This report answers the first.
+
+- Measurement accuracy: does the analyzer read the pixels correctly? Synthetic truth (§1), aligned comparisons against Dolby-authored embedded L1 and `cm_analyze` on identical pixels (§2 to §5, §7), and the HLG decode against libplacebo (§8) cover it. §6 lists the limits these comparisons found.
+- Output metadata correctness: is the final RPU well formed and consistent with the file it was muxed into? `mkvdovi --verify` checks the RPU extracted from the output (frame count, L1 ordering, L6, L9, L11, L254). In this report, the HDR10+ to L1 row of §7 Finding 2 scores generated L1 against a reference. A final-RPU regression corpus is tracked as WS6 in the [roadmap](../ROADMAP.md).
+- Playback quality: does the result look right on an identified playback chain? No controlled playback comparisons have been made. The playback test procedure is tracked as WS6 in the [roadmap](../ROADMAP.md).
+
+Generating output in the CM v4.0 metadata format does not mean the analysis reproduces Dolby's algorithm.
+
+**Analyzer version:** hdr_analyzer_mvp 0.3.0 · **Date:** 2026-07-06 (§1 to §6), 2026-07-08 (§7), 2026-09-30 (§8, 0.5.0) · **Rule:** accuracy is
 *measured, never asserted*. This report exists so that no accuracy claim in this project ever
 outruns its evidence. Reproduction commands are at the bottom.
 
@@ -19,15 +29,15 @@ Three independent ground truths, in increasing order of authority:
 3. **cm_analyze (licensed Dolby Vision Professional Tools).** Run on the *identical
    demuxed base layer* our analyzer sees (16-bit TIFF, `u16 i444 rgb tight computer pq bt2020`,
    mastering display ID 8, the reference shot list). Trial run: v5.6.4 (ARM host, qemu);
-   full run: v5.6.1 native x86-64 with CUDA on an RTX 4070 — the two versions produced
+   full run: v5.6.1 native x86-64 with CUDA on an RTX 4070; the two versions produced
    bit-identical L1 on the 24-frame verification shot. Used strictly to score output
-   accuracy — see the validation boundary in `docs/PROVENANCE.md`.
+   accuracy. See the validation boundary in `docs/PROVENANCE.md`.
 
 Comparison harness: `tools/l1_diff` (per-frame deltas in 12-bit PQ codes and nits).
 
 ## Results
 
-### 1. Synthetic truth — peaks, mean, and robust minimum
+### 1. Synthetic truth: peaks, mean, and robust minimum
 
 | Constructed peak | Measured error |
 |---|---|
@@ -44,10 +54,20 @@ Comparison harness: `tools/l1_diff` (per-frame deltas in 12-bit PQ codes and nit
 | Same plateau with chroma grain | robust peak remains within the predeclared synthetic tolerance |
 | Same plateau with multiplicative-linear grain | robust peak remains within the predeclared synthetic tolerance |
 | Clean 1000-nit plateau, robust estimator | < 0.25 of one 12-bit PQ code |
+| Grainy 200-nit plateau (σ10 = 4) with flat 1000-nit highlights in one shot: first frame, last frame, three-frame 8x8, static 2x2, and a brighter one-frame flash | robust peak within 0.25 code of the highlight on its frames and within ±(2 + 0.5σ12) of the plateau on the others; shot peak (sidecar and measurement file) is the flash |
+
+The grain fixtures draw their noise from fixed seeds. The robust estimator is steep where the
+fitted width is close to sigma: with other seeds about 1 frame in 11 of the σ10 = 4 plateau
+misses the ±(2 + 0.5σ12) tolerance (by up to 2σ) in a simulation of the fixture. The
+chroma-grain fixture, whose constant luma makes 2x2 blocks of identical pixels, misses its
+tolerance on about 1 simulated seed in 3 and returns the raw maximum on 1 in 10. A
+change of frame size, frame count or generator can therefore fail these tests without a change
+of the estimator. The highlights are flat, at least 2x2 and more than 20σ above the plateau;
+highlights near the grain and a fade are not covered ([TECHNICAL_REFERENCE.md §2.4](TECHNICAL_REFERENCE.md)).
 
 The analyzer reproduces mathematically known peaks to within the measurement format's own
 quantization (observed error ≈ 0.03 code). Pixel reading, PQ math, and file writing are exact.
-The grain fixtures use deterministic xorshift64* plus Box–Muller sampling and never clip their
+The grain fixtures use deterministic xorshift64* plus Box-Muller sampling and never clip their
 10-bit tails. Calibration used only these constructed truths; no reference CSV was consulted.
 
 ### 2. The definitional gap: Y-luma peak vs max-RGB (MaxSCL)
@@ -67,8 +87,8 @@ and the gap is purely definitional:
 **Consequence:** Y′ is exact *as a luma measurement* but is not the same quantity as DV L1 max.
 PQ direct peaks therefore now default to max-RGB; `--peak-domain luma` retains Y′ for diagnostics
 and compatibility. The implicit peak source is direct `max` in max-RGB domain, including under the
-balanced/aggressive profiles; explicit histogram peak sources and APL remain Y-based. HLG forces
-luma until per-channel scene-to-display conversion is implemented.
+balanced/aggressive profiles; explicit histogram peak sources and APL remain Y-based. HLG also
+defaults to max-RGB, measured on the full Dolby Vision 8.4 decode (§8).
 
 ### 3. cm_analyze on the identical base layer (full 2908 frames, 34 shots)
 
@@ -78,7 +98,7 @@ Completed 2026-07-06 (cm_analyze 5.6.1, native x86-64, CUDA). Three results:
 cm_analyze reports `max_pq = 2081` on every one of the 2908 frames. On the 2668 frames whose
 embedded L1 max is below 4000, the error against the Dolby-authored L1 is exactly **0.0
 codes**. On the remaining 240 frames the embedded L1 says 4095 while the BL still measures
-2081 — direct quantification of the FEL caveat in §5: those peaks exist only in the
+2081, a direct quantification of the FEL caveat in §5: those peaks exist only in the
 enhancement layer, and *no* BL-only analyzer (Dolby's included) can see them.
 
 **Pre-WS1 Y-luma baseline vs cm_analyze on identical pixels (per-frame, `tools/l1_diff`):**
@@ -96,7 +116,7 @@ disagree with cm_analyze-on-BL by even more (bias +211.7, max |error| 1487 codes
 authored metadata reflects L5 letterbox exclusion and EL composition. Scoring our average
 waits for WS1 true-mean plus letterbox handling (§5).
 
-Scene cuts: ours matched 1/34 against the reference shot list — the near-static-content
+Scene cuts: ours matched 1/34 against the reference shot list, the near-static-content
 limitation already recorded in §5.
 
 ### 4. Implemented max-RGB peak vs cm_analyze
@@ -155,8 +175,10 @@ rerun on the full corpus.
   weak spot (see roadmap WS2 / hybrid metric).
 - **P7 FEL base layers may not be HDR10-compatible.** This asset's BL is a reshaped ~14-nit
   signal. Measuring "the BL peak" of such files is well-defined but *not* comparable to the
-  composed DV picture — relevant to any BL-vs-DV-peak inspection tooling built on top of this
-  analyzer.
+  composed DV picture, which matters for any BL-vs-DV-peak inspection tooling built on top of this
+  analyzer. Every measurement on a Profile 7 FEL asset in this document is of the base layer
+  alone. No BL+EL composite has been validated, and `mkvdovi` refuses Profile 7 FEL input (see
+  [FEL_PLAN.md](FEL_PLAN.md)).
 - **avg_pq comparisons need letterbox handling** (this asset carries varying L5 offsets up to
   320 rows); peak is unaffected by black bars, averages are not.
 
@@ -165,26 +187,26 @@ rerun on the full corpus.
 Second cm_analyze round on real content, with the external resampling step removed entirely:
 cm_analyze ingested the **untouched 4:2:0 base layer** as raw yuv (layout tags embedded in the
 filename, e.g. `name_3840x2160_u10_420p_le_lsb16.yuv`, with `--source-format` carrying only
-`"ycbcr_bt2020 video pq bt2020"` — cm_analyze rejects raw-layout tags inside `--source-format`
-itself). Mastering display ID 21 (BT.2020/D65/ST.2084, 0.0001–1000 nits), CUDA, all frames.
+`"ycbcr_bt2020 video pq bt2020"`; cm_analyze rejects raw-layout tags inside `--source-format`
+itself). Mastering display ID 21 (BT.2020/D65/ST.2084, 0.0001 to 1000 nits), CUDA, all frames.
 
-Two titles, 20:00–22:00 cuts, scored per shot with `l1_diff --per-shot`:
+Two titles, 20:00-22:00 cuts, scored per shot with `l1_diff --per-shot`:
 
-- **Title A** — UHD Blu-ray remux, DV Profile 7 **MEL** (composed picture = BL, so the embedded
+- **Title A**: UHD Blu-ray remux, DV Profile 7 **MEL** (composed picture = BL, so the embedded
   Dolby-authored L1 is a full-coverage BL reference); heavy film grain; L5 letterbox 120/120;
   2855 frames / 15 shots.
-- **Title B** — 2160p web-service encode with authored HDR10+ (used to validate mkvdovi's
+- **Title B**: 2160p web-service encode with authored HDR10+ (used to validate mkvdovi's
   HDR10+→DV L1 derivation); 2825 frames / 11 shots.
 
-**Finding 1 — cm_analyze's default (CM v4) L1 is not a raw measurement.** Its per-shot peak has
+**Finding 1: cm_analyze's default (CM v4) L1 is not a raw measurement.** Its per-shot peak has
 an exact floor at PQ(100 nits) = code 2081 (4 of 15 Title A shots and 4 of 11 Title B shots report
-exactly 2081.0 while `--analysis-version 2` on the same pixels reads 1537–2541), and its "avg" is
+exactly 2081.0 while `--analysis-version 2` on the same pixels reads 1537 to 2541), and its "avg" is
 an anchored near-constant (codes 1228/1286 across every Title A shot), not a mean. The Title A embedded
 L1 was authored with the v2.9-style algorithm: embedded vs cm v2 agrees to **+16.5 codes** bias
 (median 20) while embedded vs default v4 differs by +198.0 (max 480). Measurement-style scoring
 must therefore use `--analysis-version 2`; v4 output is a mapping-oriented product.
 
-**Finding 2 — per-shot peak scores** (12-bit PQ codes, ours − reference):
+**Finding 2: per-shot peak scores** (12-bit PQ codes, ours − reference):
 
 | Comparison | bias | median \|err\| | p95 | max |
 |---|---:|---:|---:|---:|
@@ -199,35 +221,35 @@ The Title B row is the round's cleanest result: **mkvdovi's HDR10+-derived L1 is
 identical to Dolby's own v4 analyzer per shot** (median 1 code, max 17), including the v4 floor
 behavior.
 
-**Finding 3 — the chroma-reconstruction envelope is ~10 codes and filter-independent.** On the
+**Finding 3: the chroma-reconstruction envelope is ~10 codes and filter-independent.** On the
 first four Title A shots (508 frames), cm_analyze was run three ways on the same pixels:
 
 | shot (frames) | native 4:2:0 | neighbor-prep TIFF | spline-prep TIFF |
 |---|---:|---:|---:|
-| 0–28 | 2330 | 2321 | 2321 |
-| 29–90 | 2798 | 2787 | 2787 |
-| 91–146 | 2081 | 2081 | 2081 |
-| 147–507 | 2426 | 2416 | 2416 |
+| 0-28 | 2330 | 2321 | 2321 |
+| 29-90 | 2798 | 2787 | 2787 |
+| 91-146 | 2081 | 2081 | 2081 |
+| 147-507 | 2426 | 2416 | 2416 |
 
-Neighbor and spline are *identical* — the peak-determining pixels are not chroma-edge-sensitive —
-and both sit 9–11 codes below native-420. The offset comes from the YCbCr→RGB conversion/rounding
+Neighbor and spline are *identical* (the peak-determining pixels are not chroma-edge-sensitive),
+and both sit 9 to 11 codes below native-420. The offset comes from the YCbCr→RGB conversion/rounding
 path, not from upsampling-filter choice. Consequence: the nearest-neighbor chroma sharing in
 `analysis/frame.rs` stays; spline/bilinear alternatives are closed as immaterial, and prep
 artifacts cannot explain the grain gap below.
 
-**Finding 4 — the grain watch item is confirmed and quantified.** Against the like-for-like cm v2
+**Finding 4: the grain watch item is confirmed and quantified.** Against the like-for-like cm v2
 measurement on identical BL pixels, our direct max reads **+92.6 codes hot on heavy-grain Title A**
-(up to +206/shot, 377 nits worst) and **+74.4 on the milder Title B** (up to +171) — an order of
-magnitude above the ~10-code prep envelope. Dolby's peak — even in its v2 measurement form —
+(up to +206/shot, 377 nits worst) and **+74.4 on the milder Title B** (up to +171), an order of
+magnitude above the ~10-code prep envelope. Dolby's peak, even in its v2 measurement form,
 rejects isolated grain spikes that a raw maximum keeps. Closing this requires a robust peak
 estimator in the max-RGB domain (percentile/small-area filtering); that is a deliberate design
 decision tracked in the roadmap, not something to slip into a default silently.
 
-**Finding 5 — the first grain-robust estimator is useful but did not pass the default-change gate.**
+**Finding 5: the first grain-robust estimator is useful but did not pass the default-change gate.**
 A deterministic synthetic sweep calibrated a cross-quad difference histogram, Gaussian extreme-value
 correction, and noise-adjusted content floor. Before any reference contact, frame-stat dumps showed
 the expected separation: Title A median σ/correction was 14.7/22.0 codes (correction p95 79.5);
-Title B was 5.2/12.6 (p95 50.3), with clean/mild shots clustering near σ 3–5.
+Title B was 5.2/12.6 (p95 50.3), with clean/mild shots clustering near σ 3 to 5.
 
 The single predeclared cm-v2 comparison then produced:
 
@@ -236,25 +258,192 @@ The single predeclared cm-v2 comparison then produced:
 | Title A, 15 shots | +92.6 | **+80.4** | 65.3 | 205.6 / 205.6 |
 | Title B, 11 shots | +74.4 | **+66.4** | 63.6 | 170.6 / 170.6 |
 
-This is an improvement, but it misses the required clean-shot ±10–40-code envelope. Diagnostics made
+This is an improvement, but it misses the required clean-shot ±10 to 40 code envelope. Diagnostics made
 the limitation explicit: 15.9%/9.0% of frames retained the raw peak because only one pixel occupied
 the two-sigma extreme tail, and per-shot fold-max can select such a frame. The isolated-highlight
-guard is intentional—blindly suppressing a real one-pixel specular would be a different semantic
-choice—so the implementation remains opt-in via `--peak-estimator robust` and the default remains
+guard is intentional: blindly suppressing a real one-pixel specular would be a different semantic
+choice, so the implementation remains opt-in via `--peak-estimator robust` and the default remains
 `max`. No constants were changed after viewing the reference results, and the reference CSVs were
 not reopened. A future spatial-support or shot-aggregation experiment needs its own synthetic design
 and fresh validation round.
 
+The estimator described in this finding was replaced on 2026-10-02
+([TECHNICAL_REFERENCE.md §2.4](TECHNICAL_REFERENCE.md)). The numbers above belong to the old rule;
+the new rule has not been scored against `cm_analyze`.
+
 **Supporting results.** Minimum: 0.0-code error per shot everywhere; running cm with
-`--letterbox 0 0 120 120` moves the min comparison vs embedded from −2.8 to +0.1 codes — L5
+`--letterbox 0 0 120 120` moves the min comparison vs embedded from −2.8 to +0.1 codes; L5
 exclusion fully explains the min story. Averages: our max-RGB true mean matches cm v2's per-shot
-average within **+9.5 codes** (median 8.7, max 17.3) — direct evidence for the WS1 average-domain
-decision — while all comparisons against cm v4's anchored "avg" are definitional, not errors.
+average within **+9.5 codes** (median 8.7, max 17.3), direct evidence for the WS1 average-domain
+decision, while all comparisons against cm v4's anchored "avg" are definitional, not errors.
 Scene detection: on Title A, ours matched 13 of 14 authored cuts (±1 frame) while emitting 24 cuts
-total — high recall with some over-segmentation on real content, unlike the near-static FEL
+total: high recall with some over-segmentation on real content, unlike the near-static FEL
 asset's 1/34 under-detection. Caveat for the record: the
 Title B stream signals a non-default chroma siting; both cm runs used cm's default siting.
 The env-gated `real_content_consistency` integration test passed against a 15-second Title A cut.
+
+### 8. HLG: Dolby Vision 8.4 decode vs libplacebo (2026-09-30)
+
+HLG is measured through the Profile 8.4 decode that a Dolby Vision decoder applies with the RPU
+`mkvdovi` injects. By default that RPU carries the `dolby_vision` crate's `Profile84` preset
+composer; `--hlg-composer bt2100` replaces it with a composer fitted to BT.2100
+([HLG_COMPOSER.md](HLG_COMPOSER.md)). The reference is libplacebo's Dolby Vision render through
+ffmpeg's `libplacebo` filter, on lossless flat test patterns with a Profile 8.4 RPU injected by
+`dovi_tool`. Both scripts take `--composer bt2100|preset` (default `bt2100`, as in `mkvdovi`). For `bt2100` they
+rewrite the generated RPU's composer with `tools/fit_hlg_composer` (`rewrite-rpu`, the same
+function `mkvdovi` uses), run the analyzer with `--hlg-composer bt2100` and expect the sidecar
+mapping `dovi84-bt2100-v1`. libplacebo reads the composer from the RPU, so its render is an
+independent decode of the selected composer. Each frame is compared with the analyzer's per-frame
+sidecar minimum, which is not temporally smoothed and on a flat frame equals the frame's value in
+the chosen peak domain. Tolerance is 4 twelve-bit PQ codes.
+
+| Script | Patterns | Domain | Worst error, preset | Worst error, bt2100 |
+|---|---|---|---|---|
+| `scripts/validate_hlg_dv84.sh` | Grey ramp, one 10-bit luma code per frame, 64–1008 | `--peak-domain luma` (8.4 luma curve) | 3.16 | 1.77 |
+| `scripts/validate_hlg_dv84_color.sh` | 52 patches: R, G, B, Y, C, M at 100% and 75% saturation plus grey, HLG levels 0.25 / 0.5 / 0.75 / 1.0 | max-RGB (full 8.4 decode) | 0.59 | 0.49 |
+
+Errors are in 12-bit PQ codes. All four results come from one set of runs with ffmpeg
+N-125472-g97cbffe917-20260705, libplacebo v7.370.0 and llvmpipe software Vulkan (LLVM 20.1.2, not
+the GPU); the preset values match the earlier runs. Every run gave the same output on CPU and on
+`--hwaccel cuda`.
+
+- The 8.4 preset's chroma MMR curves tint neutrals slightly blue, so neutral HLG reads about 2%
+  higher in max-RGB than in luma: grey code 721 gives luma 2389 and max-RGB 2439 (libplacebo
+  2439.1). With bt2100, grey code 721 gives 2379 (libplacebo 2378.6).
+- BT.2100 reference: the colour script also prints, per patch, the BT.2100 / BT.2408 1000-nit
+  HLG-to-PQ conversion the bt2100 composer is fitted to (as max(R, G, B) in 12-bit PQ) and the
+  BT.2124 ΔE_ITP of the unclamped libplacebo render against it. The ΔE is informational and does not
+  affect the exit status. Summary lines printed by the preset run:
+
+  ```text
+  libplacebo vs BT.2100 dE_ITP (all patches, 52): mean 26.14, max 275.24
+  libplacebo vs BT.2100 dE_ITP (grey only, 4): mean 7.12, max 11.36
+  ```
+
+  and by the bt2100 run:
+
+  ```text
+  libplacebo vs BT.2100 dE_ITP (all patches, 52): mean 11.84, max 25.92
+  libplacebo vs BT.2100 dE_ITP (grey only, 4): mean 0.05, max 0.10
+  ```
+
+  Grey patches (analyzer and libplacebo in 12-bit PQ codes):
+
+  | HLG level | Y′ code | Analyzer, preset / bt2100 | libplacebo, preset / bt2100 | BT.2100 | ΔE_ITP, preset / bt2100 |
+  |---|---|---|---|---|---|
+  | 0.25 | 283 | 1223 / 1214 | 1223.2 / 1214.5 | 1214.3 | 5.20 / 0.03 |
+  | 0.50 | 502 | 1851 / 1808 | 1851.5 / 1807.9 | 1808.3 | 4.80 / 0.10 |
+  | 0.75 | 721 | 2439 / 2379 | 2439.1 / 2378.6 | 2378.2 | 7.12 / 0.07 |
+  | 1.00 | 940 | 3079 / 3079 | 3079.0 / 3078.7 | 3078.7 | 11.36 / 0.01 |
+
+  libplacebo is the clamped value; the preset's unclamped render at level 1.00 is 3155.3. These grey
+  ΔE values are measured against the BT.2100 reference neutral. The preset ΔE in HLG_COMPOSER.md §2
+  (6.75 at code 721) is measured against R = G = B at the same luminance, a different quantity. The
+  preset maximum (275.24) is the 100% magenta patch at level 1.00, which the preset renders
+  unclamped at PQ 4095.0. The largest bt2100 values are 100% cyan at 1.00 (25.92) and 100% blue at
+  0.75 (25.64).
+- Reference precision: with FBOs, libplacebo keeps intermediates in half float, which adds up to
+  about 5 codes of error on saturated colours. The colour script therefore renders with
+  `disable_fbos=1` and packed `rgba64le` output.
+- Superwhite (preset): libplacebo plateaus near 1000 nits for the brightest HLG codes. That is its display
+  tone mapping (IPT intensity clipped to the source peak it takes from the RPU's L1 max_pq, or
+  source_max_pq 3079 when L1 is absent), not Dolby Vision decoder behaviour. Rendered with L1
+  max_pq 4095, grey code 940 decodes to PQ 3155, the model's value. The colour script injects L1
+  max_pq 4095 for this reason. The analyzer still clamps luma and max-RGB to the RPU's declared
+  source range [62, 3079] on purpose, so L1 stays within that range (superwhite codes from 943 up
+  would otherwise decode to PQ 4095); the reference is compared with the same clamp. The bt2100
+  composer decodes grey 940 and neutral superwhite to PQ 3078.7. Its worst luma-ramp difference
+  (1.77) is on superwhite codes 944–1008, where libplacebo renders slightly below the analyzer's
+  3079 without L1; that looks like renderer roll-off below `source_max_pq`, not the decode, but it
+  is not proven.
+- 100% magenta at HLG level 1.0 lies outside BT.2020 (B′ > 1, G′ < 0); both sides clamp it to 3079.
+- Real content: 100 frames of the brightest scene of a BBC HLG sample (4K, frames 1999–2098,
+  losslessly re-encoded), rendered through libplacebo's DV path as above. Per-frame max-RGB agrees
+  with the render's max(R, G, B) within 6.7 codes (median 0.4); the scene maxima are 3044 against
+  3044.7. The four frames above 3 codes differ where libplacebo interpolates chroma and the analyzer
+  takes the co-sited 4:2:0 sample. Converting the render to 10-bit 4:2:0 PQ and analyzing that
+  instead reads about 12 codes higher, but the converted file's own YUV already decodes 12 codes
+  above the render, so that offset comes from the RGB-to-YUV conversion, not from the HLG measurement.
+- CPU and `--hwaccel cuda` produce identical sidecars and byte-identical measurement files on the
+  full 2-minute 4K HLG sample at `--downscale 1 --sample-rate 1`.
+
+### 9. Scene averages without temporal smoothing (2026-10-01)
+
+Until sidecar version 3 each frame average passed a forward-only EMA (`--hist-bin-ema-beta`,
+default 0.1, reset at every cut) before the scene mean was taken. The scene average therefore
+leaned toward the first frames of the scene. On the synthetic regression clip
+(`tools/l1_diff/corpus`), whose frames are flat so the true mean is known:
+
+| Shot | True scene mean | Version 3 | Version 4 |
+|---|---|---|---|
+| 24-frame fade, 168 to 2973 | 1569 | 893 | 1569 |
+| Dim scene (869) with one flash frame (3674) | 986 | 953 | 986 |
+
+Version 4 stores the unfiltered frame means. Effect on the final RPU of real clips, 0.5.1 against
+the new build, same host and flags (`scripts/rpu-baseline.sh compare`). In every clip the scene
+cuts, L1 minimum, L1 maximum and everything outside Level 1 are identical; only the L1 average
+moves:
+
+| Clip | Scenes | Scenes whose sidecar average moved by more than 10 codes | Largest change (12-bit PQ codes) |
+|---|---|---|---|
+| HDR10 demo, daylight (2860 frames) | 33 | 8 | +80 |
+| HLG fireworks (2934 frames) | 51 | 35 | -665 |
+| HLG short sample (320 frames) | 11 | 8 | +278 |
+| HLG drama episode cut (2976 frames) | 34 | 2 | -33 |
+
+Fireworks change most because every burst is a scene that brightens or fades. In the RPU the
+largest change is smaller where `dovi_tool` raises the average to its floor of 819.
+
+Not re-measured: the comparison of scene averages with `cm_analyze` v2 in §7 (+9.5 codes) was made
+with the smoothed averages. The licensed reference output is not on the development host, so that
+figure has not been repeated for version 4.
+
+## Final-RPU baseline
+
+`scripts/rpu-baseline.sh` records what `mkvdovi` finally writes, so a later build can be compared
+with it. The measurements above check the analyzer's numbers; this checks the RPU inside the muxed
+`.DV.mkv`.
+
+```bash
+# capture with the installed build (extra mkvdovi flags go after --)
+scripts/rpu-baseline.sh capture ~/mkvdovi-work/rpu-baseline/v0.5.1 sample.mkv [more.mkv ...]
+# capture the same inputs with a candidate build
+MKVDOVI=target/release/mkvdovi scripts/rpu-baseline.sh capture /tmp/candidate sample.mkv
+# compare one input
+scripts/rpu-baseline.sh compare ~/mkvdovi-work/rpu-baseline/v0.5.1/sample /tmp/candidate/sample
+```
+
+`capture` links each input into a scratch directory under the output directory, runs
+`mkvdovi --keep-source --verify` there, extracts the RPU from the resulting `.DV.mkv` and exports
+it with `dovi_tool export`. The input and its directory are not touched, and measurements lying
+next to the input are not reused, so the analysis always comes from the build under test. Per
+input it stores `RPU.bin`, `rpu.json.gz`, `scenes.txt`, the `dovi_tool info` summary, the mkvdovi
+log, the analyzer's `.l1.json` sidecar, and `manifest.json` (input name, size and sha256, capture
+time, repo commit, versions of mkvdovi, hdr_analyzer_mvp, dovi_tool, mkvmerge, ffmpeg and
+mediainfo, the mkvdovi command line, the RPU frame count). Inputs above 2 GiB are identified by
+size, mtime and the sha256 of the first 64 MiB; the manifest says which method was used. A missing
+tool, a failed conversion or verification, or an empty RPU ends the run with a non-zero status.
+
+Baselines are derived from media and are not committed. Keep them outside the repository, one
+directory per released version (on the CUDA dev host: `~/mkvdovi-work/rpu-baseline/v0.5.1/`, with
+the synthetic PQ input under `inputs/`). The analysis settings depend on the host (`--hwaccel auto`
+and `--analysis-quality auto`), so capture baseline and candidate on the same host with the same
+flags.
+
+`compare` checks, in this order: equal frame counts, equal scene-cut flags, and identical content
+outside Level 1 (profile, header, mapping and reshaping data, L2, L5, L6, L9, L11, L254 and every
+other block). The Level 1 payload and the per-frame `rpu_data_crc32`, which covers it, are left out
+of that check. Level 1 is scored: for min, avg and max it prints the number of changed frames, the
+mean signed difference and the largest absolute difference in 12-bit PQ codes. Exit status 0 means
+nothing outside L1 differs, 1 means a difference, 2 means a usage or tool error.
+
+The rule:
+
+- A change that is meant to alter L1 is approved by reviewing the `compare` L1 score in the pull
+  request. Paste the output for every baseline input.
+- Any difference outside L1 is a regression. This includes scene-cut positions and the frame count.
+- A change that must not alter the output (a refactor, a performance change) is compared with
+  `--require-identical-l1`, which makes any L1 difference a failure too.
 
 ## Reproduction
 
@@ -279,7 +468,12 @@ cargo run --release --manifest-path tools/l1_diff/Cargo.toml -- \
 # synthetic truth
 cargo test -p hdr_analyzer_mvp --test synthetic_accuracy
 
-# real-content round (§7) — sample prep on the analysis host
+# HLG 8.4 decode vs libplacebo (§8); needs ffmpeg with libx265 + libplacebo (Vulkan), dovi_tool, python3
+# --composer bt2100 also needs cargo (it builds tools/fit_hlg_composer to rewrite the RPU)
+bash scripts/validate_hlg_dv84.sh [path/to/hdr_analyzer_mvp] [--hwaccel cuda] [--composer preset|bt2100]         # luma, grey ramp
+bash scripts/validate_hlg_dv84_color.sh [path/to/hdr_analyzer_mvp] [--hwaccel cuda] [--composer preset|bt2100]   # max-RGB, colour patches
+
+# real-content round (§7): sample prep on the analysis host
 mkvmerge -o sample.mkv --no-audio --no-subtitles --split parts:00:20:00-00:22:00 SOURCE.mkv
 ffmpeg -i sample.mkv -c:v copy -bsf:v hevc_mp4toannexb sample.hevc
 dovi_tool demux -i sample.hevc --bl-out BL.hevc --el-out EL.hevc   # P7 input
@@ -287,7 +481,7 @@ dovi_tool extract-rpu -i sample.hevc -o rpu.bin
 dovi_tool export -i rpu.bin -d all=rpu.json -d scenes=scenes.txt   # embedded L1 + shotlist
 hdr10plus_tool extract -i sample.hevc -o hdr10plus.json            # HDR10+ input
 
-# real-content round (§7) — cm_analyze on the untouched 4:2:0 BL (x86-64 + CUDA host)
+# real-content round (§7): cm_analyze on the untouched 4:2:0 BL (x86-64 + CUDA host)
 ffmpeg -i BL.hevc -f rawvideo -pix_fmt yuv420p10le bl_3840x2160_u10_420p_le_lsb16.yuv
 ./cm_analyze -s shotlist.txt -m 21 -r 24000/1001 --analysis-version 2 \
   --source-format "ycbcr_bt2020 video pq bt2020" \

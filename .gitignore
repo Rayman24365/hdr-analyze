@@ -1,7 +1,6 @@
 # Rust build artifacts
 /target/
 tools/*/target/
-Cargo.lock
 
 # IDE files
 .vscode/
@@ -54,12 +53,18 @@ codebase.md
 VIDEOTOOLBOX_OPTIMIZATION_SUMMARY.md
 DOCUMENTATION_UPDATE_SUMMARY.md
 /tests/
+/testfiles/
 docs/VIDEOTOOLBOX_OPTIMIZATION_SUMMARY.md
 AGENTS.md
 
-# Local agent/tooling state
+# Local agent/tooling state (the shared Claude Code hook config is committed)
 .agent/
-.claude/
+.claude/*
+!.claude/settings.json
+!.claude/hooks/
+!.claude/skills/
+!.claude/agents/
+!.claude/workflows/
 .codex/
 
 # Local scratch/checkouts
